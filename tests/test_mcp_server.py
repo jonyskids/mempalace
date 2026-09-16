@@ -8,6 +8,7 @@ via monkeypatch to avoid touching real data.
 
 from datetime import datetime
 import json
+import logging
 import os
 from pathlib import Path
 import sqlite3
@@ -3924,6 +3925,58 @@ class TestKGTools:
         # Regression #1314: response must echo the actual ended date,
         # not silently drop it and return the literal string "today".
         assert result["ended"] == "2026-03-01"
+        # The response must say how many open facts were actually closed,
+        # so "success" is a measured outcome rather than a shape.
+        assert result["matched"] == 1
+
+    def test_kg_invalidate_no_match_is_not_a_success(
+        self, monkeypatch, config, palace_path, seeded_kg, caplog
+    ):
+        """An object that matches no open fact must not come back success-shaped.
+
+        The object is a lookup key: a typo or a re-worded fact matches nothing
+        and the UPDATE touches no rows. The old response echoed the CALLER'S
+        input back as ``fact`` with ``success: true``, so a stale fact stayed
+        live behind what read as confirmation of a write.
+        """
+        _patch_mcp_server(monkeypatch, config, seeded_kg)
+        from mempalace import mcp_server
+
+        with caplog.at_level(logging.WARNING, logger="mempalace_mcp"):
+            result = mcp_server.tool_kg_invalidate(
+                subject="Max",
+                predicate="does",
+                object="a pastime nobody ever stored",
+                ended="2026-03-01",
+            )
+
+        assert result["success"] is False
+        assert result["matched"] == 0
+        assert result.get("error_class") == "NoMatchingFact"
+        assert "no open fact" in result["error"]
+
+        # ... and the no-op is visible in the log, not only in the return value.
+        assert any(
+            "kg_invalidate" in rec.getMessage() and "NoMatchingFact" in rec.getMessage()
+            for rec in caplog.records
+        ), [rec.getMessage() for rec in caplog.records]
+
+        # The fact it failed to close is still open.
+        facts = seeded_kg.query_entity("Max", direction="outgoing")
+        assert any(f["object"] == "chess" and f["current"] for f in facts)
+
+    def test_kg_invalidate_second_call_reports_no_match(
+        self, monkeypatch, config, palace_path, seeded_kg
+    ):
+        """Re-invalidating an already-ended fact closes nothing and says so."""
+        _patch_mcp_server(monkeypatch, config, seeded_kg)
+        from mempalace import mcp_server
+
+        first = mcp_server.tool_kg_invalidate("Max", "does", "chess", ended="2026-03-01")
+        second = mcp_server.tool_kg_invalidate("Max", "does", "chess", ended="2026-03-01")
+
+        assert first["success"] is True and first["matched"] == 1
+        assert second["success"] is False and second["matched"] == 0
 
     def test_kg_supersede(self, monkeypatch, config, palace_path, kg):
         _patch_mcp_server(monkeypatch, config, kg)
@@ -5210,6 +5263,87 @@ class TestStructuredErrors:
         # wire contract, and drift silently un-fixes #2014 (the daemon would
         # stop recognising the refusal and dead-letter the job again).
         assert result.get("error_class") == daemon.LOCK_REFUSAL_ERROR_CLASS
+
+    def test_tool_sync_lock_refusal_is_logged(self, monkeypatch, tmp_path, caplog):
+        """A refused write must leave a trace in the server log.
+
+        The refusal dict only reaches the MCP client. When a peer held the
+        lease for a whole session the logfile held nothing at all, so the
+        refusals were invisible to anyone reading ``mcp_server.log`` --
+        diagnosis was guesswork. Note the asymmetry this fixes: the sibling
+        ``except Exception`` branches already logged; lock contention, the
+        common case, was the silent one.
+        """
+        from mempalace import mcp_server
+        from mempalace.palace import MineAlreadyRunning
+
+        cfg = MagicMock()
+        cfg.palace_path = str(tmp_path / "palace")
+        monkeypatch.setattr(mcp_server, "_config", cfg)
+        monkeypatch.setattr(mcp_server, "_get_kg", lambda *a, **kw: MagicMock())
+
+        def _raise_locked(*args, **kwargs):
+            raise MineAlreadyRunning("palace is held by PID 999")
+
+        import mempalace.sync as sync_mod
+
+        monkeypatch.setattr(sync_mod, "sync_palace", _raise_locked, raising=False)
+
+        with caplog.at_level(logging.WARNING, logger="mempalace_mcp"):
+            result = mcp_server.tool_sync()
+
+        assert result["success"] is False
+        messages = [rec.getMessage() for rec in caplog.records]
+        assert any("held by PID 999" in m and "mempalace_sync" in m for m in messages), messages
+
+    def test_tool_diary_write_lock_refusal_is_logged(self, monkeypatch, caplog):
+        """Same trace requirement on the diary write path."""
+        from mempalace import mcp_server
+        from mempalace.palace import MineAlreadyRunning
+
+        class _LeaseHeldCollection:
+            def add(self, **kwargs):
+                raise MineAlreadyRunning("palace /p is held by PID 999 (mempalace-mcp)")
+
+        monkeypatch.setattr(
+            mcp_server, "_get_collection", lambda create=False: _LeaseHeldCollection()
+        )
+        monkeypatch.setattr(mcp_server, "_wal_log", lambda *a, **kw: None)
+
+        with caplog.at_level(logging.WARNING, logger="mempalace_mcp"):
+            result = mcp_server.tool_diary_write(agent_name="tester", entry="verbatim", topic="t")
+
+        assert result["success"] is False
+        messages = [rec.getMessage() for rec in caplog.records]
+        assert any("held by PID 999" in m and "mempalace_diary_write" in m for m in messages), (
+            messages
+        )
+
+    def test_peer_writer_refusal_is_logged(self, monkeypatch, tmp_path, caplog):
+        """The dispatch-level refusal (peer owns the lease) must log too.
+
+        This is the path that refuses every mutating tool while another
+        process holds the palace lease -- the one that produced a whole
+        session of refused writes with no log line.
+        """
+        from mempalace import mcp_server
+
+        cfg = MagicMock()
+        cfg.palace_path = str(tmp_path / "palace")
+        monkeypatch.setattr(mcp_server, "_config", cfg)
+        monkeypatch.setattr(
+            mcp_server,
+            "_acquire_mcp_writer_lock",
+            lambda: (False, "another mempalace writer already holds the palace lock: pid=999"),
+        )
+        monkeypatch.setattr(mcp_server, "_MCP_WRITER_LOCK_FAILED", False)
+
+        with caplog.at_level(logging.WARNING, logger="mempalace_mcp"):
+            refusal = mcp_server._mcp_peer_writer_refusal(req_id=1, tool_name="mempalace_kg_add")
+
+        assert refusal is not None
+        messages = [rec.getMessage() for rec in caplog.records]
+        assert any("mempalace_kg_add" in m and "pid=999" in m for m in messages), messages
 
     def test_mcp_idle_timeout_invalid_env_disables_watchdog(self, monkeypatch):
         """Invalid MEMPALACE_MCP_IDLE_HOURS disables idle auto-exit."""

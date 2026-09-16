@@ -125,6 +125,34 @@ class TestInvalidation:
         assert chess[0]["valid_to"] == "2026-01-01"
         assert chess[0]["current"] is False
 
+    def test_invalidate_returns_number_of_facts_closed(self, seeded_kg):
+        """A caller must be able to tell a real close from a no-op."""
+        assert seeded_kg.invalidate("Max", "does", "chess", ended="2026-01-01") == 1
+
+    def test_invalidate_returns_zero_when_no_open_fact_matches(self, seeded_kg):
+        """A non-matching object must report 0, not an unqualified 'done'.
+
+        The object is a lookup key. A typo, a re-worded fact, or a fact that
+        was already ended matches nothing, and the UPDATE touches no rows --
+        so the caller has to be told nothing was closed, otherwise a stale
+        fact stays live behind a success-shaped answer.
+        """
+        closed = seeded_kg.invalidate(
+            "Max", "does", "a pastime nobody ever stored", ended="2026-01-01"
+        )
+        assert closed == 0
+
+        still_open = [
+            r
+            for r in seeded_kg.query_entity("Max", direction="outgoing")
+            if r["predicate"] == "does" and r["current"]
+        ]
+        assert {r["object"] for r in still_open} == {"swimming", "chess"}
+
+    def test_invalidate_twice_reports_zero_the_second_time(self, seeded_kg):
+        assert seeded_kg.invalidate("Max", "does", "chess", ended="2026-01-01") == 1
+        assert seeded_kg.invalidate("Max", "does", "chess", ended="2026-01-01") == 0
+
 
 class TestTimeline:
     def test_timeline_all(self, seeded_kg):

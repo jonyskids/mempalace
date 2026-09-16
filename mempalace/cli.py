@@ -1147,6 +1147,10 @@ class _DryRunKnowledgeGraphProxy:
 
     def invalidate(self, *args, **kwargs):
         self.operations.append(("invalidate", args, kwargs))
+        # Real ``invalidate`` returns how many open facts it closed. A dry run
+        # closes none, and 0 says exactly that — keeping the recorded surface
+        # type-compatible with an adapter that checks the count.
+        return 0
 
     def supersede(self, *args, **kwargs):
         self.operations.append(("supersede", args, kwargs))

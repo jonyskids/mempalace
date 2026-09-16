@@ -885,9 +885,28 @@ def test_kg_tools_all_use_provider_sibling_kg(initialized_provider, palace_path)
         )
     )
     assert inv["success"] is True
+    assert inv["matched"] == 1
 
     # And the file itself lives next to the palace dir.
     assert (Path(palace_path).parent / "knowledge_graph.sqlite3").exists()
+
+
+def test_kg_invalidate_no_match_is_not_a_success(initialized_provider):
+    """Same contract as the MCP tool: nothing closed is not a success.
+
+    The provider carries its own copy of the invalidate path, so the honesty
+    fix has to hold here too — otherwise a Hermes agent gets the old
+    success-shaped answer for a fact that is still live.
+    """
+    result = json.loads(
+        initialized_provider.handle_tool_call(
+            "mempalace_kg_invalidate",
+            {"subject": "user", "predicate": "drinks", "object": "a drink never stored"},
+        )
+    )
+    assert result["success"] is False
+    assert result["matched"] == 0
+    assert result["error_class"] == "NoMatchingFact"
 
 
 def test_kg_invalidate_rejects_invalid_input(initialized_provider):

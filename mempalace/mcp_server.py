@@ -804,6 +804,26 @@ def _acquire_mcp_writer_lock() -> tuple[bool, str]:
     return True, ""
 
 
+def _refused_write(tool: str, error: str, error_class: str, **extra) -> dict:
+    """Payload for a write that did NOT happen — logged as well as returned.
+
+    One shape for the whole class: the caller gets ``success: False`` plus a
+    machine-readable ``error_class``, and ``mcp_server.log`` gets a line
+    naming the tool. The log half is the part that used to be missing. Lock
+    contention — by far the most common refusal — returned its dict silently
+    while the sibling ``except Exception`` branches logged theirs, so a
+    session's worth of refused writes could leave no trace at all and
+    diagnosis was guesswork.
+
+    ``extra`` carries evidence for the specific refusal (e.g. ``matched``).
+    It is spread FIRST on purpose, so no caller can overwrite ``success``
+    with a truthy value and reinstate the very failure mode this fixes.
+    """
+    payload = {**extra, "success": False, "error": error, "error_class": error_class}
+    logger.warning("%s refused: %s (error_class=%s)", tool, error, error_class)
+    return payload
+
+
 def _mcp_peer_writer_refusal(req_id, tool_name: str):
     if tool_name not in _MUTATING_TOOLS or tool_name in _PEER_WRITER_EXEMPT_TOOLS:
         return None
@@ -811,6 +831,16 @@ def _mcp_peer_writer_refusal(req_id, tool_name: str):
     ok, reason = _acquire_mcp_writer_lock()
     if ok:
         return None
+
+    # Log every refused mutating request. This runs only when a write is
+    # actually being turned away, so the volume is bounded by refused writes
+    # -- and each line is one write the caller believes it asked for.
+    logger.warning(
+        "%s refused: %s (failure_kind=%s)",
+        tool_name,
+        reason,
+        "initialization_failed" if _MCP_WRITER_LOCK_FAILED else "peer_contention",
+    )
 
     return {
         "jsonrpc": "2.0",
@@ -3544,11 +3574,11 @@ def tool_mine(
         # tool_sync) so MineAlreadyRunning / MineValidationError / ValueError
         # don't fall into the generic "mine failed" branch.
         except MineAlreadyRunning as exc:
-            return {
-                "success": False,
-                "error": f"another mine is in progress: {exc}",
-                "error_class": LOCK_REFUSAL_ERROR_CLASS,
-            }
+            return _refused_write(
+                "mempalace_mine",
+                f"another mine is in progress: {exc}",
+                LOCK_REFUSAL_ERROR_CLASS,
+            )
         except MineValidationError as exc:
             return {
                 "success": False,
@@ -3779,11 +3809,11 @@ def tool_sync(project_dir: str = None, wing: str = None, apply: bool = False):
         # below, otherwise MineAlreadyRunning and ValueError fall into the
         # generic "sync failed" branch and break the structured-error tests.
         except MineAlreadyRunning as exc:
-            return {
-                "success": False,
-                "error": f"another mine is in progress: {exc}",
-                "error_class": LOCK_REFUSAL_ERROR_CLASS,
-            }
+            return _refused_write(
+                "mempalace_sync",
+                f"another mine is in progress: {exc}",
+                LOCK_REFUSAL_ERROR_CLASS,
+            )
         except ValueError as exc:
             return {"success": False, "error": str(exc)}
         except Exception as exc:
@@ -4153,9 +4183,15 @@ def tool_kg_add(
 def tool_kg_invalidate(subject: str, predicate: str, object: str, ended: str = None):
     """Mark a fact as no longer true.
 
-    Returns the actual ``ended`` date/time that was stored. When the caller
-    omits ``ended``, the underlying graph stamps ``date.today()`` and the
-    response reflects that resolved value.
+    Returns ``matched`` — how many open facts were actually closed — and the
+    actual ``ended`` date/time that was stored. When the caller omits
+    ``ended``, the underlying graph stamps ``date.today()`` and the response
+    reflects that resolved value.
+
+    ``object`` is matched verbatim against stored facts. When it matches no
+    open fact the response is ``success: False`` with ``matched: 0`` and
+    ``error_class: "NoMatchingFact"``: nothing was written, and a caller that
+    reads only ``success`` must not conclude the fact was retired.
 
     Temporal values accept either ``YYYY-MM-DD`` or canonical UTC datetimes in
     the form ``YYYY-MM-DDTHH:MM:SSZ``.
@@ -4180,11 +4216,31 @@ def tool_kg_invalidate(subject: str, predicate: str, object: str, ended: str = N
         },
     )
 
-    _call_kg(lambda kg: kg.invalidate(subject, predicate, object, ended=resolved_ended))
+    matched = _call_kg(lambda kg: kg.invalidate(subject, predicate, object, ended=resolved_ended))
+    fact = f"{subject} → {predicate} → {object}"
+    if not matched:
+        # Nothing was retired. The old response returned success with this
+        # same ``fact`` string -- which is the CALLER'S input echoed back,
+        # never a stored row -- so a mistyped or re-worded object read as
+        # confirmation while the stale fact stayed live.
+        return _refused_write(
+            "mempalace_kg_invalidate",
+            (
+                f"no open fact matched {fact} — nothing was invalidated. "
+                "The object is matched verbatim against stored facts: it may "
+                "already be ended, or the stored wording may differ. Check "
+                "mempalace_kg_query before retrying."
+            ),
+            "NoMatchingFact",
+            fact=fact,
+            ended=resolved_ended,
+            matched=0,
+        )
     return {
         "success": True,
-        "fact": f"{subject} → {predicate} → {object}",
+        "fact": fact,
         "ended": resolved_ended,
+        "matched": matched,
     }
 
 
@@ -4395,11 +4451,11 @@ def tool_diary_write(agent_name: str, entry: str, topic: str = "general", wing: 
         # and the queued diary entry is dropped. The daemon's constant, not a
         # literal: the two sides are a wire contract, and drift on either end
         # silently un-fixes #2014.
-        return {
-            "success": False,
-            "error": f"another mine is in progress: {e}",
-            "error_class": LOCK_REFUSAL_ERROR_CLASS,
-        }
+        return _refused_write(
+            "mempalace_diary_write",
+            f"another mine is in progress: {e}",
+            LOCK_REFUSAL_ERROR_CLASS,
+        )
     except Exception as e:
         return {"success": False, "error": str(e)}
 
@@ -5190,7 +5246,7 @@ TOOLS = {
         "handler": tool_kg_add,
     },
     "mempalace_kg_invalidate": {
-        "description": "Mark a fact as no longer true. E.g. ankle injury resolved, job ended, moved house.",
+        "description": "Mark a fact as no longer true. E.g. ankle injury resolved, job ended, moved house. The object is matched verbatim: check `matched` in the response — 0 means no open fact matched and nothing was retired.",
         "input_schema": {
             "type": "object",
             "properties": {

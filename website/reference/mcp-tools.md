@@ -276,7 +276,14 @@ Mark a fact as no longer true.
 | `object` | string | **Yes** | Connected entity |
 | `ended` | string | No | When it stopped being true (default: today) |
 
-**Returns:** `{ success, fact, ended }`
+**Returns:** `{ success, fact, ended, matched }`
+
+`object` is matched verbatim against stored facts. When it matches no open
+fact, nothing is written and the call returns
+`{ success: false, matched: 0, error_class: "NoMatchingFact", ... }` — a
+mistyped or re-worded object leaves the original fact live, so treat
+`matched` (not the presence of a response) as the evidence that a fact was
+retired. The refusal is also written to `mcp_server.log`.
 
 ---
 
