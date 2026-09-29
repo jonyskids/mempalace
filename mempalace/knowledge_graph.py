@@ -493,12 +493,28 @@ class KnowledgeGraph:
 
     # ── Query operations ──────────────────────────────────────────────────
 
-    def query_entity(self, name: str, as_of: str = None, direction: str = "outgoing"):
+    def query_entity(
+        self,
+        name: str,
+        as_of: str = None,
+        direction: str = "outgoing",
+        predicates=None,
+    ):
         """
         Get all relationships for an entity.
 
         direction: "outgoing" (entity → ?), "incoming" (? → entity), "both"
         as_of: ISO date or canonical UTC datetime — only return facts valid then
+        predicates: optional iterable of predicate names. When given, only
+            triples whose predicate is one of them are returned. Names are
+            normalized the same way ``add_triple`` normalizes them
+            (lowercased, spaces → underscores) so callers can pass either
+            form. A falsy value (None or empty) means "no predicate filter",
+            preserving the historical unfiltered behaviour exactly.
+
+        The predicate filter is applied in SQL alongside the ``as_of``
+        temporal filter and inside the same ``direction`` branches, so the
+        three compose rather than forking a second query path.
         """
         as_of = sanitize_iso_temporal(as_of, "as_of")
         eid = self._entity_id(name)
@@ -509,15 +525,32 @@ class KnowledgeGraph:
         if as_of:
             temporal_sql, temporal_params = _temporal_filter_sql(as_of)
 
+        predicate_sql = ""
+        predicate_params: list = []
+        if predicates:
+            normalized = []
+            for raw in predicates:
+                pred = str(raw).lower().replace(" ", "_").strip()
+                if pred and pred not in normalized:
+                    normalized.append(pred)
+            if normalized:
+                placeholders = ",".join("?" for _ in normalized)
+                predicate_sql = f" AND t.predicate IN ({placeholders})"
+                predicate_params = normalized
+        # One WHERE-suffix for every query below, including the
+        # unambiguous-candidate fallback, so the filters never diverge.
+        filter_sql = temporal_sql + predicate_sql
+        filter_params = temporal_params + predicate_params
+
         with self._lock:
             conn = self._conn()
 
             if direction in ("outgoing", "both"):
                 query = (
                     "SELECT t.*, e.name as obj_name FROM triples t "
-                    "JOIN entities e ON t.object = e.id WHERE t.subject = ?" + temporal_sql
+                    "JOIN entities e ON t.object = e.id WHERE t.subject = ?" + filter_sql
                 )
-                params = [eid] + temporal_params
+                params = [eid] + filter_params
 
                 for row in conn.execute(query, params).fetchall():
                     results.append(
@@ -537,9 +570,9 @@ class KnowledgeGraph:
             if direction in ("incoming", "both"):
                 query = (
                     "SELECT t.*, e.name as sub_name FROM triples t "
-                    "JOIN entities e ON t.subject = e.id WHERE t.object = ?" + temporal_sql
+                    "JOIN entities e ON t.subject = e.id WHERE t.object = ?" + filter_sql
                 )
-                params = [eid] + temporal_params
+                params = [eid] + filter_params
 
                 for row in conn.execute(query, params).fetchall():
                     results.append(
@@ -572,8 +605,8 @@ class KnowledgeGraph:
                                 cand_id,
                                 cand_name,
                                 direction,
-                                temporal_sql,
-                                temporal_params,
+                                filter_sql,
+                                filter_params,
                             )
                         )
 

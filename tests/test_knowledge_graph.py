@@ -116,6 +116,50 @@ class TestQueries:
         assert len(results) == 2  # swimming + chess
 
 
+class TestQueryEntityPredicateFilter:
+    """query_entity(predicates=...) must compose with direction and as_of."""
+
+    def test_absent_filter_is_unchanged(self, seeded_kg):
+        baseline = seeded_kg.query_entity("Alice", direction="both")
+        assert seeded_kg.query_entity("Alice", direction="both", predicates=None) == baseline
+
+    def test_single_predicate_slices(self, seeded_kg):
+        results = seeded_kg.query_entity("Max", direction="both", predicates=["does"])
+        assert {r["predicate"] for r in results} == {"does"}
+        assert {r["object"] for r in results} == {"swimming", "chess"}
+
+    def test_multiple_predicates_union(self, seeded_kg):
+        results = seeded_kg.query_entity(
+            "Alice", direction="outgoing", predicates=["parent_of", "works_at"]
+        )
+        assert {r["predicate"] for r in results} == {"parent_of", "works_at"}
+
+    def test_names_are_normalized_like_add_triple(self, seeded_kg):
+        results = seeded_kg.query_entity("Alice", direction="outgoing", predicates=["Parent Of"])
+        assert {r["predicate"] for r in results} == {"parent_of"}
+
+    def test_composes_with_direction(self, seeded_kg):
+        # parent_of exists in both directions across Alice/Max; scoping the
+        # direction must still apply on top of the predicate filter.
+        incoming = seeded_kg.query_entity("Max", direction="incoming", predicates=["parent_of"])
+        outgoing = seeded_kg.query_entity("Max", direction="outgoing", predicates=["parent_of"])
+        assert [r["direction"] for r in incoming] == ["incoming"]
+        assert outgoing == []
+
+    def test_composes_with_as_of(self, seeded_kg):
+        expired = seeded_kg.query_entity(
+            "Alice", as_of="2023-06-01", direction="outgoing", predicates=["works_at"]
+        )
+        current = seeded_kg.query_entity(
+            "Alice", as_of="2025-06-01", direction="outgoing", predicates=["works_at"]
+        )
+        assert [r["object"] for r in expired] == ["Acme Corp"]
+        assert [r["object"] for r in current] == ["NewCo"]
+
+    def test_unknown_predicate_returns_empty(self, seeded_kg):
+        assert seeded_kg.query_entity("Alice", direction="both", predicates=["nope"]) == []
+
+
 class TestInvalidation:
     def test_invalidate_sets_valid_to(self, seeded_kg):
         seeded_kg.invalidate("Max", "does", "chess", ended="2026-01-01")

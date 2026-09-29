@@ -37,7 +37,17 @@ TOOLS = {
         "handler": tool_get_aaak_spec,
     },
     "mempalace_kg_query": {
-        "description": "Query the knowledge graph for an entity's relationships. Returns typed facts with temporal validity. E.g. 'Max' → child_of Alice, loves chess, does swimming. Filter by date with as_of to see what was true at a point in time.",
+        "description": (
+            "Query the knowledge graph for an entity's relationships. Returns typed facts "
+            "with temporal validity. E.g. 'Max' → child_of Alice, loves chess, does swimming. "
+            "Filter by date with as_of to see what was true at a point in time. "
+            "For a hub entity carrying thousands of facts (a long-running project), pass "
+            "predicate= to get ONE complete slice — e.g. predicate='pending_task' — instead of "
+            "an arbitrary truncated prefix of everything. predicate, direction and as_of compose. "
+            "Any truncation is always reported in a 'notice' field, never silent; an unfiltered "
+            "query that overflows, and a filtered query that matches nothing, both come back "
+            "with a 'predicates' histogram naming the slices available to re-query."
+        ),
         "input_schema": {
             "type": "object",
             "properties": {
@@ -52,6 +62,18 @@ TOOLS = {
                 "direction": {
                     "type": "string",
                     "description": "outgoing (entity→?), incoming (?→entity), or both (default: both)",
+                },
+                "predicate": {
+                    "description": (
+                        "Predicate filter (optional). One name ('completed'), several as a "
+                        "comma-separated string ('completed,shipped'), or a list. Case and "
+                        "spaces are normalized ('Learned Pattern' → 'learned_pattern'). "
+                        "Omit for every fact, exactly as before this parameter existed."
+                    ),
+                    "anyOf": [
+                        {"type": "string"},
+                        {"type": "array", "items": {"type": "string"}},
+                    ],
                 },
             },
             "required": ["entity"],

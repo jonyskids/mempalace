@@ -258,8 +258,24 @@ Query entity relationships with time filtering.
 | `entity` | string | **Yes** | Entity to query (e.g. "Max", "MyProject") |
 | `as_of` | string | No | Date filter — only facts valid at this date (YYYY-MM-DD) |
 | `direction` | string | No | `outgoing`, `incoming`, or `both` (default: `both`) |
+| `predicate` | string or array | No | Return only these relationship types. One name (`"completed"`), a comma-separated list (`"completed,shipped"`), or an array. Case and spaces are normalized. Omit for every fact. |
+
+`predicate`, `direction` and `as_of` are applied together in one query.
 
 **Returns:** `{ entity, as_of, facts: [{ direction, subject, predicate, object, valid_from, valid_to, current }], count }`
+
+When `predicate` is supplied it is echoed back as a normalized list.
+
+A hub entity can hold more facts than one response can carry. Truncation is always
+reported — `truncated: true` plus a `notice` naming how many facts were omitted — and
+never silent, so an absent fact is never mistaken for a fact that does not exist.
+A filtered result that is still over the cap says so in the same `notice`.
+
+Two dead ends additionally return `predicates` (a `{name: count}` histogram of that
+entity's predicates in the same direction/as-of slice), `predicates_distinct`, an
+optional `predicates_omitted`, and a `predicate_hint` telling the caller what to
+re-query: an **unfiltered query that overflowed**, and a **filtered query that matched
+nothing** (usually a predicate synonym).
 
 ---
 

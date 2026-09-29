@@ -60,42 +60,100 @@ def _fact_interval_bucket(row: dict, now_key: str) -> str:
     return "active"
 
 
-def tool_kg_query(entity: str, as_of: str = None, direction: str = "both"):
-    """Query the knowledge graph for an entity's relationships."""
-    try:
-        entity = sanitize_kg_value(entity, "entity")
-        as_of = sanitize_iso_temporal(as_of, "as_of")
-    except ValueError as e:
-        return {"error": str(e)}
+# Max distinct predicates listed in the histogram attached to a dead-end
+# kg_query response. A hub entity can carry well over a hundred distinct
+# predicates (project:digital-p had 177 on 2026-08-23), most of them
+# singletons; the top slice by fact count is what a caller actually re-queries
+# with, and the tail would crowd out the facts themselves.
+KG_PREDICATE_HISTOGRAM_LIMIT = 25
 
-    if direction not in ("outgoing", "incoming", "both"):
-        return {"error": "direction must be 'outgoing', 'incoming', or 'both'"}
 
-    results = _call_kg(lambda kg: kg.query_entity(entity, as_of=as_of, direction=direction))
-    total = len(results) if isinstance(results, list) else None
-    # Cap BEFORE bucketing so the interval buckets describe exactly the facts
-    # that ship, never a superset of them.
-    facts, notice = _cap_facts(
-        results, narrow_hint="narrow with as_of= or direction= to see the rest"
-    )
-    if as_of is None:
-        now_key = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-        active = []
-        historical = []
-        future = []
-        for row in facts:
-            bucket = _fact_interval_bucket(row, now_key)
-            if bucket == "future":
-                future.append(row)
-            elif bucket == "historical":
-                historical.append(row)
-            else:
-                active.append(row)
+def _normalize_predicate_filter(predicate):
+    """Normalize the ``predicate=`` argument of ``tool_kg_query``.
+
+    Accepts a single name ("completed"), a comma-separated string
+    ("completed,shipped") or a list of names. Returns
+    ``(predicates_or_None, error_or_None)``; ``(None, None)`` means the
+    caller passed no filter and the query must behave exactly as it did
+    before this parameter existed.
+    """
+    if predicate is None:
+        return None, None
+
+    if isinstance(predicate, str):
+        raw_items = predicate.split(",")
+    elif isinstance(predicate, (list, tuple)):
+        raw_items = []
+        for item in predicate:
+            if not isinstance(item, str):
+                return None, "predicate list entries must be strings"
+            raw_items.extend(item.split(","))
     else:
-        active = facts
-        historical = []
-        future = []
-    payload = {
+        return None, "predicate must be a string or a list of strings"
+
+    normalized = []
+    for item in raw_items:
+        item = item.strip()
+        if not item:
+            continue
+        try:
+            item = sanitize_name(item, "predicate")
+        except ValueError as e:
+            return None, str(e)
+        item = item.lower().replace(" ", "_")
+        if item not in normalized:
+            normalized.append(item)
+
+    if not normalized:
+        return None, "predicate must name at least one predicate"
+    return normalized, None
+
+
+def _predicate_histogram(results, limit: Optional[int] = None):
+    """Return ``(top_counts, omitted_predicates, distinct_predicates)``.
+
+    Computed from facts already in hand, so it always describes exactly the
+    ``direction`` / ``as_of`` slice the caller asked about. ``limit`` is
+    resolved from module state at call time (not bound as a default) so an
+    override takes effect for the call that sets it.
+    """
+    if limit is None:
+        limit = KG_PREDICATE_HISTOGRAM_LIMIT
+    counts: dict = {}
+    for fact in results:
+        if not isinstance(fact, dict):
+            continue
+        pred = fact.get("predicate")
+        if pred is None:
+            continue
+        counts[pred] = counts.get(pred, 0) + 1
+    ordered = sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))
+    top = dict(ordered[:limit])
+    return top, len(ordered) - len(top), len(ordered)
+
+
+def _interval_buckets(facts: list, as_of) -> tuple[list, list, list]:
+    """Split shipped facts into v3.10's active / historical / future buckets."""
+    if as_of is not None:
+        return facts, [], []
+    now_key = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    active = []
+    historical = []
+    future = []
+    for row in facts:
+        bucket = _fact_interval_bucket(row, now_key)
+        if bucket == "future":
+            future.append(row)
+        elif bucket == "historical":
+            historical.append(row)
+        else:
+            active.append(row)
+    return active, historical, future
+
+
+def _kg_query_base_payload(entity: str, as_of, facts: list) -> dict:
+    active, historical, future = _interval_buckets(facts, as_of)
+    return {
         "entity": entity,
         "as_of": as_of,
         "active_facts": active,
@@ -104,10 +162,10 @@ def tool_kg_query(entity: str, as_of: str = None, direction: str = "both"):
         "facts": facts,
         "count": len(facts),
     }
-    if notice is not None:
-        payload["total"] = total
-        payload["truncated"] = True
-        payload["notice"] = notice
+
+
+def _kg_query_resolve_entity(payload: dict, entity: str, results: list, *, lookup_candidates: bool):
+    """Upstream (v3.10) entity resolution: resolved_from, or candidates on a miss."""
     if results:
         resolved_names = {
             r.get("subject") if r.get("direction") == "outgoing" else r.get("object")
@@ -119,11 +177,113 @@ def tool_kg_query(entity: str, as_of: str = None, direction: str = "both"):
             if resolved != entity:
                 payload["resolved_from"] = entity
                 payload["entity"] = resolved
-    else:
+    elif lookup_candidates:
         candidates = _call_kg(lambda kg: kg.find_entity_candidates(entity))
         if candidates:
             payload["candidates"] = candidates
-    return payload
+
+
+def tool_kg_query(
+    entity: str,
+    as_of: str = None,
+    direction: str = "both",
+    predicate=None,
+):
+    """Query the knowledge graph for an entity's relationships.
+
+    ``predicate`` filters to one or more relationship types. It composes with
+    ``direction`` and ``as_of`` in a single SQL query rather than forking a
+    second path, and is a pure no-op when omitted.
+
+    A hub entity can carry thousands of facts, far past both the
+    ``KG_RESULT_CAP`` fact cap and the serialized response cap. Truncation is
+    always announced. When an *unfiltered* query is truncated, or when a
+    *filtered* query matches nothing, the response also carries a predicate
+    histogram and an instruction, so a dead end becomes a next query instead
+    of a silent absence the caller misreads as "no such fact".
+
+    The fact cap is applied BEFORE v3.10's active / historical / future
+    buckets are derived, so the buckets always describe exactly the facts in
+    ``facts`` and never a superset of them.
+    """
+    try:
+        entity = sanitize_kg_value(entity, "entity")
+        as_of = sanitize_iso_temporal(as_of, "as_of")
+    except ValueError as e:
+        return {"error": str(e)}
+
+    if direction not in ("outgoing", "incoming", "both"):
+        return {"error": "direction must be 'outgoing', 'incoming', or 'both'"}
+
+    predicates, predicate_error = _normalize_predicate_filter(predicate)
+    if predicate_error is not None:
+        return {"error": predicate_error}
+
+    results = _call_kg(
+        lambda kg: kg.query_entity(entity, as_of=as_of, direction=direction, predicates=predicates)
+    )
+    total = len(results) if isinstance(results, list) else None
+
+    if predicates:
+        narrow_hint = (
+            f"this is ALREADY a predicate-filtered slice ({', '.join(predicates)}) and it "
+            f"is STILL over the {KG_RESULT_CAP}-fact cap — narrow further with a single "
+            "predicate=, or with as_of= / direction="
+        )
+    else:
+        narrow_hint = (
+            "narrow with predicate= (the 'predicates' field in this response lists the "
+            "available slices and their fact counts), as_of= or direction="
+        )
+    facts, notice = _cap_facts(results, narrow_hint=narrow_hint)
+
+    response = _kg_query_base_payload(entity, as_of, facts)
+    if predicates:
+        response["predicate"] = predicates
+    if notice is not None:
+        response["total"] = total
+        response["truncated"] = True
+        response["notice"] = notice
+
+    # Rescue the two dead ends: an unfiltered query too big to return whole,
+    # and a filtered query that matched nothing (usually a predicate synonym).
+    histogram_source = None
+    hint = None
+    if not predicates and notice is not None and isinstance(results, list):
+        histogram_source = results
+        hint = (
+            f"Showing an arbitrary first {KG_RESULT_CAP} of {total} facts. Re-query with "
+            "predicate='<name>' (or a comma-separated list) to get one COMPLETE slice "
+            "instead. 'predicates' lists this entity's predicates by fact count."
+        )
+    elif predicates and isinstance(results, list) and not results:
+        unfiltered = _call_kg(lambda kg: kg.query_entity(entity, as_of=as_of, direction=direction))
+        if isinstance(unfiltered, list) and unfiltered:
+            histogram_source = unfiltered
+            hint = (
+                f"No fact on this entity uses predicate {', '.join(predicates)} in this "
+                "direction/as_of slice. 'predicates' lists the predicates it DOES use — "
+                "check for a synonym there before writing a new fact."
+            )
+
+    # Entity candidates only when the entity itself carries nothing: a
+    # filtered miss on an entity that DOES have facts is answered by the
+    # predicate histogram, not by a list of similarly named entities.
+    _kg_query_resolve_entity(response, entity, results, lookup_candidates=not histogram_source)
+
+    if histogram_source:
+        top, omitted, distinct = _predicate_histogram(histogram_source)
+        response["predicates"] = top
+        response["predicates_distinct"] = distinct
+        if omitted:
+            response["predicates_omitted"] = omitted
+            hint = (
+                hint + f" ({omitted} rarer predicate(s) not listed; "
+                f"showing the top {len(top)} of {distinct}.)"
+            )
+        response["predicate_hint"] = hint
+
+    return response
 
 
 def tool_kg_add(

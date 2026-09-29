@@ -546,6 +546,210 @@ class TestKGTools:
         assert result["success"] is False
         assert "exceeds maximum length" in result["error"]
 
+    # ── predicate= filter ───────────────────────────────────────────────
+    #
+    # project:digital-p carried 2,127 active facts (~354KB of object text) on
+    # 2026-08-23, far past both the fact cap and the 50KB response cap, so an
+    # unfiltered query on it could only ever return an arbitrary prefix. The
+    # filter makes one slice retrievable whole. Omitting it must change
+    # nothing at all for existing callers.
+
+    def test_kg_query_default_response_shape_unchanged(
+        self, monkeypatch, config, palace_path, seeded_kg
+    ):
+        _patch_mcp_server(monkeypatch, config, seeded_kg)
+        from mempalace.mcp_server import tool_kg_query
+
+        result = tool_kg_query(entity="Max")
+        # v3.10's default shape: the interval buckets plus facts/count.
+        assert set(result) == {
+            "entity",
+            "as_of",
+            "active_facts",
+            "historical_facts",
+            "future_facts",
+            "facts",
+            "count",
+        }
+        assert result["count"] == 3
+
+    def test_kg_query_single_predicate(self, monkeypatch, config, palace_path, seeded_kg):
+        _patch_mcp_server(monkeypatch, config, seeded_kg)
+        from mempalace.mcp_server import tool_kg_query
+
+        result = tool_kg_query(entity="Max", predicate="does")
+        assert result["predicate"] == ["does"]
+        assert {f["predicate"] for f in result["facts"]} == {"does"}
+        assert result["count"] == 2
+
+    def test_kg_query_comma_separated_predicates(self, monkeypatch, config, palace_path, seeded_kg):
+        _patch_mcp_server(monkeypatch, config, seeded_kg)
+        from mempalace.mcp_server import tool_kg_query
+
+        result = tool_kg_query(entity="Alice", predicate="parent_of,works_at")
+        assert result["predicate"] == ["parent_of", "works_at"]
+        assert {f["predicate"] for f in result["facts"]} == {"parent_of", "works_at"}
+
+    def test_kg_query_predicate_list(self, monkeypatch, config, palace_path, seeded_kg):
+        _patch_mcp_server(monkeypatch, config, seeded_kg)
+        from mempalace.mcp_server import tool_kg_query
+
+        result = tool_kg_query(entity="Alice", predicate=["parent_of", "works_at"])
+        assert {f["predicate"] for f in result["facts"]} == {"parent_of", "works_at"}
+
+    def test_kg_query_predicate_is_normalized(self, monkeypatch, config, palace_path, seeded_kg):
+        _patch_mcp_server(monkeypatch, config, seeded_kg)
+        from mempalace.mcp_server import tool_kg_query
+
+        result = tool_kg_query(entity="Alice", predicate="Parent Of")
+        assert result["predicate"] == ["parent_of"]
+        assert result["count"] == 1
+
+    def test_kg_query_predicate_composes_with_direction_and_as_of(
+        self, monkeypatch, config, palace_path, seeded_kg
+    ):
+        _patch_mcp_server(monkeypatch, config, seeded_kg)
+        from mempalace.mcp_server import tool_kg_query
+
+        expired = tool_kg_query(
+            entity="Alice", predicate="works_at", direction="outgoing", as_of="2023-06-01"
+        )
+        current = tool_kg_query(
+            entity="Alice", predicate="works_at", direction="outgoing", as_of="2025-06-01"
+        )
+        assert [f["object"] for f in expired["facts"]] == ["Acme Corp"]
+        assert [f["object"] for f in current["facts"]] == ["NewCo"]
+
+        incoming = tool_kg_query(entity="Max", predicate="parent_of", direction="incoming")
+        outgoing = tool_kg_query(entity="Max", predicate="parent_of", direction="outgoing")
+        assert incoming["count"] == 1
+        assert outgoing["count"] == 0
+
+    def test_kg_query_rejects_bad_predicate_argument(
+        self, monkeypatch, config, palace_path, seeded_kg
+    ):
+        _patch_mcp_server(monkeypatch, config, seeded_kg)
+        from mempalace.mcp_server import tool_kg_query
+
+        assert "error" in tool_kg_query(entity="Max", predicate=17)
+        assert "error" in tool_kg_query(entity="Max", predicate=["does", 17])
+        assert "error" in tool_kg_query(entity="Max", predicate="  ,  ")
+        assert "error" in tool_kg_query(entity="Max", predicate="../etc/passwd")
+
+    def test_kg_query_over_cap_unfiltered_returns_histogram_and_instruction(
+        self, monkeypatch, config, palace_path, seeded_kg
+    ):
+        from mempalace import mcp_server
+
+        _patch_mcp_server(monkeypatch, config, seeded_kg)
+        monkeypatch.setattr(mcp_server, "KG_RESULT_CAP", 2)
+
+        result = mcp_server.tool_kg_query(entity="Max")
+        assert result["truncated"] is True
+        assert result["total"] == 3
+        assert result["count"] == 2
+        # Truncation announces itself and points at the way out.
+        assert "predicate=" in result["notice"]
+        assert result["predicates"] == {"does": 2, "parent_of": 1}
+        assert result["predicates_distinct"] == 2
+        assert "predicate=" in result["predicate_hint"]
+
+    def test_kg_query_over_cap_filtered_says_the_slice_is_still_over(
+        self, monkeypatch, config, palace_path, seeded_kg
+    ):
+        from mempalace import mcp_server
+
+        _patch_mcp_server(monkeypatch, config, seeded_kg)
+        monkeypatch.setattr(mcp_server, "KG_RESULT_CAP", 1)
+
+        result = mcp_server.tool_kg_query(entity="Max", predicate="does")
+        assert result["truncated"] is True
+        assert result["total"] == 2
+        assert "ALREADY" in result["notice"]
+        assert "STILL over" in result["notice"]
+        assert "does" in result["notice"]
+        # Already filtered: the caller knows the slice, so no histogram noise.
+        assert "predicates" not in result
+
+    def test_kg_query_zero_match_lists_the_predicates_that_do_exist(
+        self, monkeypatch, config, palace_path, seeded_kg
+    ):
+        _patch_mcp_server(monkeypatch, config, seeded_kg)
+        from mempalace.mcp_server import tool_kg_query
+
+        result = tool_kg_query(entity="Max", predicate="learned")
+        assert result["count"] == 0
+        assert result["predicates"] == {"does": 2, "parent_of": 1}
+        assert "synonym" in result["predicate_hint"]
+
+    def test_kg_query_histogram_is_capped_and_says_so(
+        self, monkeypatch, config, palace_path, seeded_kg
+    ):
+        from mempalace import mcp_server
+
+        _patch_mcp_server(monkeypatch, config, seeded_kg)
+        monkeypatch.setattr(mcp_server, "KG_RESULT_CAP", 2)
+        monkeypatch.setattr(mcp_server, "KG_PREDICATE_HISTOGRAM_LIMIT", 1)
+
+        result = mcp_server.tool_kg_query(entity="Max")
+        assert result["predicates"] == {"does": 2}
+        assert result["predicates_omitted"] == 1
+        assert result["predicates_distinct"] == 2
+        assert "not listed" in result["predicate_hint"]
+
+    def test_kg_query_schema_documents_the_predicate_parameter(self):
+        from mempalace.mcp_server import TOOLS
+
+        entry = TOOLS["mempalace_kg_query"]
+        assert "predicate" in entry["input_schema"]["properties"]
+        assert entry["input_schema"]["required"] == ["entity"]
+        assert "predicate" in entry["description"]
+
+    # ── v3.10 port: predicate filter vs upstream candidate resolution ──
+
+    def test_predicate_filter_applies_to_candidate_fallback(
+        self, monkeypatch, config, palace_path, seeded_kg
+    ):
+        """v3.10 resolves an unambiguous near-miss name ('Acme' -> 'Acme Corp').
+        The predicate filter must reach that fallback query too."""
+        _patch_mcp_server(monkeypatch, config, seeded_kg)
+        from mempalace.mcp_server import tool_kg_query
+
+        hit = tool_kg_query(entity="Acme", predicate="works_at")
+        assert [f["predicate"] for f in hit["facts"]] == ["works_at"]
+        assert hit.get("resolved_from") == "Acme"
+
+        miss = seeded_kg.query_entity("Acme", direction="both", predicates=["parent_of"])
+        assert miss == []
+
+    def test_filtered_miss_on_existing_entity_skips_candidates(
+        self, monkeypatch, config, palace_path, seeded_kg
+    ):
+        """An entity that HAS facts answers a filtered miss with its predicate
+        histogram, not with a list of similarly named entities."""
+        _patch_mcp_server(monkeypatch, config, seeded_kg)
+        from mempalace.mcp_server import tool_kg_query
+
+        result = tool_kg_query(entity="Max", predicate="no_such_predicate")
+        assert result["count"] == 0
+        assert "candidates" not in result
+        assert set(result["predicates"]) == {"does", "parent_of"}
+
+    def test_interval_buckets_only_hold_shipped_facts(
+        self, monkeypatch, config, palace_path, seeded_kg
+    ):
+        """The fact cap runs before bucketing, so active/historical/future never
+        carry a fact that 'facts' dropped."""
+        _patch_mcp_server(monkeypatch, config, seeded_kg)
+        from mempalace import mcp_server
+
+        monkeypatch.setattr(mcp_server, "KG_RESULT_CAP", 1)
+        result = mcp_server.tool_kg_query(entity="Alice")
+        shipped = result["facts"]
+        bucketed = result["active_facts"] + result["historical_facts"] + result["future_facts"]
+        assert len(shipped) == 1
+        assert bucketed == shipped
+
 
 class TestKGLazyCache:
     """Lazy per-path KnowledgeGraph cache (issue #1136)."""

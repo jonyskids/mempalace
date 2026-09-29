@@ -8,6 +8,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Features
+
+- **`mempalace_kg_query` takes a `predicate` filter.** A long-lived hub entity outgrows any single response: `project:digital-p` reached 2,127 active facts (~354 KB of object text) against a 50 KB response cap, so every query on it came back as an arbitrary truncated prefix — which broke the "query before adding" convention on exactly the entity where a duplicate fact costs the most. `predicate=` returns one slice whole: a single name (`"pending_task"`), a comma-separated list, or an array; case and spaces are normalized the way `kg_add` normalizes them. The filter is applied in SQL inside the existing `direction` branches, alongside the `as_of` clause, so the three compose instead of forking a second query path, and omitting it leaves the old behaviour byte-identical. When a query still cannot fit, the truncation is announced as before — and two dead ends now come back usable rather than opaque: an unfiltered query that overflows, and a filtered query that matches nothing, both return a `predicates` histogram of that entity's predicates by fact count plus a `predicate_hint` naming the next query.
+
 ---
 
 ## [3.10.0] — 2026-09-15
