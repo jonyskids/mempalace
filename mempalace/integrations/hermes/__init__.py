@@ -1516,16 +1516,38 @@ class MempalaceProvider(MemoryProvider):  # type: ignore[misc]
         resolved_ended = ended or date.today().isoformat()
         kg = KnowledgeGraph(db_path=self._kg_db_path())
         try:
-            kg.invalidate(subject, predicate, obj, ended=resolved_ended)
+            matched = kg.invalidate(subject, predicate, obj, ended=resolved_ended)
         finally:
             try:
                 kg.close()
             except Exception:
                 pass
+        fact = f"{subject} → {predicate} → {obj}"
+        if not matched:
+            # Same contract as mcp_server.tool_kg_invalidate: an object that
+            # matches no open fact closed nothing, so it must not come back
+            # success-shaped with the caller's own input echoed as ``fact``.
+            error = (
+                f"no open fact matched {fact} — nothing was invalidated. "
+                "The object is matched verbatim against stored facts: it may "
+                "already be ended, or the stored wording may differ."
+            )
+            logger.warning(
+                "mempalace_kg_invalidate refused: %s (error_class=%s)", error, "NoMatchingFact"
+            )
+            return {
+                "success": False,
+                "error": error,
+                "error_class": "NoMatchingFact",
+                "fact": fact,
+                "ended": resolved_ended,
+                "matched": 0,
+            }
         return {
             "success": True,
-            "fact": f"{subject} → {predicate} → {obj}",
+            "fact": fact,
             "ended": resolved_ended,
+            "matched": matched,
         }
 
     def _tool_kg_timeline(self, entity: Optional[str] = None) -> Dict[str, Any]:

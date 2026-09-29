@@ -130,7 +130,7 @@ TOOLS = {
         "handler": tool_kg_add,
     },
     "mempalace_kg_invalidate": {
-        "description": "Mark a fact as no longer true. E.g. ankle injury resolved, job ended, moved house.",
+        "description": "Mark a fact as no longer true. E.g. ankle injury resolved, job ended, moved house. The object is matched verbatim: check `matched` in the response — 0 means no open fact matched and nothing was retired.",
         "input_schema": {
             "type": "object",
             "properties": {

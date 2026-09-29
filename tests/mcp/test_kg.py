@@ -1,5 +1,6 @@
 """MCP server tests — knowledge-graph tools and tenant cache."""
 
+import logging
 import os
 import subprocess
 import sys
@@ -44,6 +45,10 @@ class TestKGTools:
         # Regression #1314: response must echo the actual ended date,
         # not silently drop it and return the literal string "today".
         assert result["ended"] == "2026-03-01"
+
+        # The response must say how many open facts were actually closed,
+        # so "success" is a measured outcome rather than a shape.
+        assert result["matched"] == 1
 
     def test_kg_supersede(self, monkeypatch, config, palace_path, kg):
         _patch_mcp_server(monkeypatch, config, kg)
@@ -933,6 +938,55 @@ class TestKGTools:
         assert entry["input_schema"]["properties"]["summary"]["type"] == "boolean"
         assert entry["input_schema"]["required"] == ["entity"]
         assert "summary" in entry["description"]
+
+    def test_kg_invalidate_no_match_is_not_a_success(
+        self, monkeypatch, config, palace_path, seeded_kg, caplog
+    ):
+        """An object that matches no open fact must not come back success-shaped.
+
+        The object is a lookup key: a typo or a re-worded fact matches nothing
+        and the UPDATE touches no rows. The old response echoed the CALLER'S
+        input back as ``fact`` with ``success: true``, so a stale fact stayed
+        live behind what read as confirmation of a write.
+        """
+        _patch_mcp_server(monkeypatch, config, seeded_kg)
+        from mempalace import mcp_server
+
+        with caplog.at_level(logging.WARNING, logger="mempalace_mcp"):
+            result = mcp_server.tool_kg_invalidate(
+                subject="Max",
+                predicate="does",
+                object="a pastime nobody ever stored",
+                ended="2026-03-01",
+            )
+
+        assert result["success"] is False
+        assert result["matched"] == 0
+        assert result.get("error_class") == "NoMatchingFact"
+        assert "no open fact" in result["error"]
+
+        # ... and the no-op is visible in the log, not only in the return value.
+        assert any(
+            "kg_invalidate" in rec.getMessage() and "NoMatchingFact" in rec.getMessage()
+            for rec in caplog.records
+        ), [rec.getMessage() for rec in caplog.records]
+
+        # The fact it failed to close is still open.
+        facts = seeded_kg.query_entity("Max", direction="outgoing")
+        assert any(f["object"] == "chess" and f["current"] for f in facts)
+
+    def test_kg_invalidate_second_call_reports_no_match(
+        self, monkeypatch, config, palace_path, seeded_kg
+    ):
+        """Re-invalidating an already-ended fact closes nothing and says so."""
+        _patch_mcp_server(monkeypatch, config, seeded_kg)
+        from mempalace import mcp_server
+
+        first = mcp_server.tool_kg_invalidate("Max", "does", "chess", ended="2026-03-01")
+        second = mcp_server.tool_kg_invalidate("Max", "does", "chess", ended="2026-03-01")
+
+        assert first["success"] is True and first["matched"] == 1
+        assert second["success"] is False and second["matched"] == 0
 
     # ── v3.10 port: predicate filter vs upstream candidate resolution ──
 

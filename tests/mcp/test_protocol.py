@@ -1,6 +1,7 @@
 """MCP server tests — protocol, dispatch, and session cache."""
 
 import json
+import logging
 import os
 import subprocess
 import sys
@@ -1830,8 +1831,88 @@ class TestStructuredErrors:
         assert len(constructed) == 1, f"expected 1 KG construction, got {len(constructed)}"
         assert len(mcp_server._kg_by_path) == 1
 
+    # ── Param-shape diagnostics on tools/call dispatch (#1351) ──────────────
 
-# ── Param-shape diagnostics on tools/call dispatch (#1351) ──────────────
+    def test_tool_sync_lock_refusal_is_logged(self, monkeypatch, tmp_path, caplog):
+        """A refused write must leave a trace in the server log.
+
+        The refusal dict only reaches the MCP client. When a peer held the
+        lease for a whole session the logfile held nothing at all, so the
+        refusals were invisible to anyone reading ``mcp_server.log`` --
+        diagnosis was guesswork. Note the asymmetry this fixes: the sibling
+        ``except Exception`` branches already logged; lock contention, the
+        common case, was the silent one.
+        """
+        from mempalace import mcp_server
+        from mempalace.palace import MineAlreadyRunning
+
+        cfg = MagicMock()
+        cfg.palace_path = str(tmp_path / "palace")
+        monkeypatch.setattr(mcp_server, "_config", cfg)
+        monkeypatch.setattr(mcp_server, "_get_kg", lambda *a, **kw: MagicMock())
+
+        def _raise_locked(*args, **kwargs):
+            raise MineAlreadyRunning("palace is held by PID 999")
+
+        import mempalace.sync as sync_mod
+
+        monkeypatch.setattr(sync_mod, "sync_palace", _raise_locked, raising=False)
+
+        with caplog.at_level(logging.WARNING, logger="mempalace_mcp"):
+            result = mcp_server.tool_sync()
+
+        assert result["success"] is False
+        messages = [rec.getMessage() for rec in caplog.records]
+        assert any("held by PID 999" in m and "mempalace_sync" in m for m in messages), messages
+
+    def test_tool_diary_write_lock_refusal_is_logged(self, monkeypatch, caplog):
+        """Same trace requirement on the diary write path."""
+        from mempalace import mcp_server
+        from mempalace.palace import MineAlreadyRunning
+
+        class _LeaseHeldCollection:
+            def add(self, **kwargs):
+                raise MineAlreadyRunning("palace /p is held by PID 999 (mempalace-mcp)")
+
+        monkeypatch.setattr(
+            mcp_server, "_get_collection", lambda create=False: _LeaseHeldCollection()
+        )
+        monkeypatch.setattr(mcp_server, "_wal_log", lambda *a, **kw: None)
+
+        with caplog.at_level(logging.WARNING, logger="mempalace_mcp"):
+            result = mcp_server.tool_diary_write(agent_name="tester", entry="verbatim", topic="t")
+
+        assert result["success"] is False
+        messages = [rec.getMessage() for rec in caplog.records]
+        assert any("held by PID 999" in m and "mempalace_diary_write" in m for m in messages), (
+            messages
+        )
+
+    def test_peer_writer_refusal_is_logged(self, monkeypatch, tmp_path, caplog):
+        """The dispatch-level refusal (peer owns the lease) must log too.
+
+        This is the path that refuses every mutating tool while another
+        process holds the palace lease -- the one that produced a whole
+        session of refused writes with no log line.
+        """
+        from mempalace import mcp_server
+
+        cfg = MagicMock()
+        cfg.palace_path = str(tmp_path / "palace")
+        monkeypatch.setattr(mcp_server, "_config", cfg)
+        monkeypatch.setattr(
+            mcp_server,
+            "_acquire_mcp_writer_lock",
+            lambda: (False, "another mempalace writer already holds the palace lock: pid=999"),
+        )
+        monkeypatch.setattr(mcp_server, "_MCP_WRITER_LOCK_FAILED", False)
+
+        with caplog.at_level(logging.WARNING, logger="mempalace_mcp"):
+            refusal = mcp_server._mcp_peer_writer_refusal(req_id=1, tool_name="mempalace_kg_add")
+
+        assert refusal is not None
+        messages = [rec.getMessage() for rec in caplog.records]
+        assert any("mempalace_kg_add" in m and "pid=999" in m for m in messages), messages
 
 
 class TestParamShapeDiagnostics:

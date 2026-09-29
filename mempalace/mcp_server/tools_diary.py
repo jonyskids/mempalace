@@ -143,11 +143,11 @@ def tool_diary_write(agent_name: str, entry: str, topic: str = "general", wing: 
         # and the queued diary entry is dropped. The daemon's constant, not a
         # literal: the two sides are a wire contract, and drift on either end
         # silently un-fixes #2014.
-        return {
-            "success": False,
-            "error": f"another mine is in progress: {e}",
-            "error_class": LOCK_REFUSAL_ERROR_CLASS,
-        }
+        return _refused_write(
+            "mempalace_diary_write",
+            f"another mine is in progress: {e}",
+            LOCK_REFUSAL_ERROR_CLASS,
+        )
     except Exception as e:
         return {"success": False, "error": str(e)}
 

@@ -749,11 +749,11 @@ def tool_mine(
         # tool_sync) so MineAlreadyRunning / MineValidationError / ValueError
         # don't fall into the generic "mine failed" branch.
         except MineAlreadyRunning as exc:
-            return {
-                "success": False,
-                "error": f"another mine is in progress: {exc}",
-                "error_class": LOCK_REFUSAL_ERROR_CLASS,
-            }
+            return _refused_write(
+                "mempalace_mine",
+                f"another mine is in progress: {exc}",
+                LOCK_REFUSAL_ERROR_CLASS,
+            )
         except MineValidationError as exc:
             return {
                 "success": False,
@@ -984,11 +984,11 @@ def tool_sync(project_dir: str = None, wing: str = None, apply: bool = False):
         # below, otherwise MineAlreadyRunning and ValueError fall into the
         # generic "sync failed" branch and break the structured-error tests.
         except MineAlreadyRunning as exc:
-            return {
-                "success": False,
-                "error": f"another mine is in progress: {exc}",
-                "error_class": LOCK_REFUSAL_ERROR_CLASS,
-            }
+            return _refused_write(
+                "mempalace_sync",
+                f"another mine is in progress: {exc}",
+                LOCK_REFUSAL_ERROR_CLASS,
+            )
         except ValueError as exc:
             return {"success": False, "error": str(exc)}
         except Exception as exc:

@@ -569,6 +569,26 @@ def _acquire_mcp_writer_lock() -> tuple[bool, str]:
     return True, ""
 
 
+def _refused_write(tool: str, error: str, error_class: str, **extra) -> dict:
+    """Payload for a write that did NOT happen — logged as well as returned.
+
+    One shape for the whole class: the caller gets ``success: False`` plus a
+    machine-readable ``error_class``, and ``mcp_server.log`` gets a line
+    naming the tool. The log half is the part that used to be missing. Lock
+    contention — by far the most common refusal — returned its dict silently
+    while the sibling ``except Exception`` branches logged theirs, so a
+    session's worth of refused writes could leave no trace at all and
+    diagnosis was guesswork.
+
+    ``extra`` carries evidence for the specific refusal (e.g. ``matched``).
+    It is spread FIRST on purpose, so no caller can overwrite ``success``
+    with a truthy value and reinstate the very failure mode this fixes.
+    """
+    payload = {**extra, "success": False, "error": error, "error_class": error_class}
+    logger.warning("%s refused: %s (error_class=%s)", tool, error, error_class)
+    return payload
+
+
 def _mcp_peer_writer_refusal(req_id, tool_name: str):
     if tool_name not in _MUTATING_TOOLS or tool_name in _PEER_WRITER_EXEMPT_TOOLS:
         return None
@@ -576,6 +596,16 @@ def _mcp_peer_writer_refusal(req_id, tool_name: str):
     ok, reason = _acquire_mcp_writer_lock()
     if ok:
         return None
+
+    # Log every refused mutating request. This runs only when a write is
+    # actually being turned away, so the volume is bounded by refused writes
+    # -- and each line is one write the caller believes it asked for.
+    logger.warning(
+        "%s refused: %s (failure_kind=%s)",
+        tool_name,
+        reason,
+        "initialization_failed" if _MCP_WRITER_LOCK_FAILED else "peer_contention",
+    )
 
     return {
         "jsonrpc": "2.0",

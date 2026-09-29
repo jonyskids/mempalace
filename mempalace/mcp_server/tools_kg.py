@@ -584,9 +584,15 @@ def tool_kg_add(
 def tool_kg_invalidate(subject: str, predicate: str, object: str, ended: str = None):
     """Mark a fact as no longer true.
 
-    Returns the actual ``ended`` date/time that was stored. When the caller
-    omits ``ended``, the underlying graph stamps ``date.today()`` and the
-    response reflects that resolved value.
+    Returns ``matched`` — how many open facts were actually closed — and the
+    actual ``ended`` date/time that was stored. When the caller omits
+    ``ended``, the underlying graph stamps ``date.today()`` and the response
+    reflects that resolved value.
+
+    ``object`` is matched verbatim against stored facts. When it matches no
+    open fact the response is ``success: False`` with ``matched: 0`` and
+    ``error_class: "NoMatchingFact"``: nothing was written, and a caller that
+    reads only ``success`` must not conclude the fact was retired.
 
     Temporal values accept either ``YYYY-MM-DD`` or canonical UTC datetimes in
     the form ``YYYY-MM-DDTHH:MM:SSZ``.
@@ -621,11 +627,31 @@ def tool_kg_invalidate(subject: str, predicate: str, object: str, ended: str = N
         },
     )
 
-    _call_kg(lambda kg: kg.invalidate(subject, predicate, object, ended=resolved_ended))
+    matched = _call_kg(lambda kg: kg.invalidate(subject, predicate, object, ended=resolved_ended))
+    fact = f"{subject} → {predicate} → {object}"
+    if not matched:
+        # Nothing was retired. The old response returned success with this
+        # same ``fact`` string -- which is the CALLER'S input echoed back,
+        # never a stored row -- so a mistyped or re-worded object read as
+        # confirmation while the stale fact stayed live.
+        return _refused_write(
+            "mempalace_kg_invalidate",
+            (
+                f"no open fact matched {fact} — nothing was invalidated. "
+                "The object is matched verbatim against stored facts: it may "
+                "already be ended, or the stored wording may differ. Check "
+                "mempalace_kg_query before retrying."
+            ),
+            "NoMatchingFact",
+            fact=fact,
+            ended=resolved_ended,
+            matched=0,
+        )
     return {
         "success": True,
-        "fact": f"{subject} → {predicate} → {object}",
+        "fact": fact,
         "ended": resolved_ended,
+        "matched": matched,
     }
 
 

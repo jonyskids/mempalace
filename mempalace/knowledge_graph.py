@@ -340,8 +340,16 @@ class KnowledgeGraph:
                 )
                 return triple_id
 
-    def invalidate(self, subject: str, predicate: str, obj: str, ended: str = None):
-        """Mark a relationship as no longer valid (set valid_to date/time)."""
+    def invalidate(self, subject: str, predicate: str, obj: str, ended: str = None) -> int:
+        """Mark a relationship as no longer valid (set valid_to date/time).
+
+        Returns the number of open triples actually closed. ``obj`` is a
+        lookup key against stored facts, so a typo, a re-worded object, or a
+        fact that was already ended matches nothing and the UPDATE touches no
+        rows. Callers must treat ``0`` as "nothing was retired" rather than
+        assuming the fact is now historical — the row count is the only
+        evidence that the write happened.
+        """
         sub_id = self._entity_id(subject)
         obj_id = self._entity_id(obj)
         pred = predicate.lower().replace(" ", "_")
@@ -366,11 +374,14 @@ class KnowledgeGraph:
                             "an inverted interval would be invisible to every KG query"
                         )
 
-                conn.execute(
+                cursor = conn.execute(
                     "UPDATE triples SET valid_to=? "
                     "WHERE subject=? AND predicate=? AND object=? AND valid_to IS NULL",
                     (ended, sub_id, pred, obj_id),
                 )
+                # rowcount, not len(rows): the count that is returned is the
+                # one the database actually applied.
+                return cursor.rowcount if cursor.rowcount >= 0 else len(rows)
 
     def supersede(
         self,
