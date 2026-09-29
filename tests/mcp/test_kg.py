@@ -705,6 +705,235 @@ class TestKGTools:
         assert entry["input_schema"]["required"] == ["entity"]
         assert "predicate" in entry["description"]
 
+    # ── summary= mode ───────────────────────────────────────────────────
+    #
+    # A hub entity's query result overflowed the cap and came back as an
+    # arbitrary prefix, with no way to tell what the other rows were.
+    # query_entity applies no valid_to filter unless as_of is given, so the
+    # over-cap count blended dead facts with live ones: project:digital-p
+    # + pending_task was 335 rows / 93 current on 2026-08-24, and the 100
+    # returned held only 45 live facts. Summary mode returns a complete
+    # per-predicate histogram split current/invalidated, plus a sample
+    # spread across predicates and biased to live facts.
+
+    def test_kg_summary_is_absent_when_the_result_fits(
+        self, monkeypatch, config, palace_path, seeded_kg
+    ):
+        _patch_mcp_server(monkeypatch, config, seeded_kg)
+        from mempalace.mcp_server import tool_kg_query
+
+        # The no-op guarantee: default summary= never touches a fitting response.
+        assert set(tool_kg_query(entity="Max")) == {
+            "entity",
+            "as_of",
+            "active_facts",
+            "historical_facts",
+            "future_facts",
+            "facts",
+            "count",
+        }
+        assert "summary" not in tool_kg_query(entity="Max", predicate="does")
+
+    def test_kg_summary_opt_in_summarizes_an_entity_that_fits(
+        self, monkeypatch, config, palace_path, seeded_kg
+    ):
+        _patch_mcp_server(monkeypatch, config, seeded_kg)
+        from mempalace.mcp_server import tool_kg_query
+
+        result = tool_kg_query(entity="Alice", direction="outgoing", summary=True)
+        summary = result["summary"]
+        assert summary["total"] == 3
+        assert summary["current"] == 2
+        assert summary["invalidated"] == 1
+        assert summary["histogram"] == {"works_at": [1, 1], "parent_of": [1, 0]}
+        # Everything fit, so nothing is withheld and nothing claims truncation.
+        assert result["count"] == 3
+        assert "truncated" not in result
+        assert "notice" not in result
+
+    def test_kg_summary_is_automatic_on_overflow(self, monkeypatch, config, palace_path, seeded_kg):
+        from mempalace import mcp_server
+
+        _patch_mcp_server(monkeypatch, config, seeded_kg)
+        monkeypatch.setattr(mcp_server, "KG_RESULT_CAP", 2)
+
+        result = mcp_server.tool_kg_query(entity="Max")
+        assert result["truncated"] is True
+        assert result["summary"]["total"] == 3
+        assert result["summary"]["predicates_distinct"] == 2
+        # The old "arbitrary first N" wording is a lie about a sample.
+        assert "arbitrary" not in result["notice"]
+        assert "arbitrary" not in result["predicate_hint"]
+        assert "sample" in result["notice"]
+
+    def test_kg_summary_false_restores_the_plain_prefix(
+        self, monkeypatch, config, palace_path, seeded_kg
+    ):
+        from mempalace import mcp_server
+
+        _patch_mcp_server(monkeypatch, config, seeded_kg)
+        monkeypatch.setattr(mcp_server, "KG_RESULT_CAP", 2)
+
+        result = mcp_server.tool_kg_query(entity="Max", summary=False)
+        assert "summary" not in result
+        assert result["truncated"] is True
+        assert "showing first 2 of 3" in result["notice"]
+        assert "arbitrary" in result["predicate_hint"]
+
+    def test_kg_summary_counts_split_current_from_invalidated(
+        self, monkeypatch, config, palace_path, kg
+    ):
+        from mempalace import mcp_server
+
+        _patch_mcp_server(monkeypatch, config, kg)
+        for i in range(9):
+            kg.add_triple(
+                "project:hub",
+                "pending_task",
+                f"dead task {i}",
+                valid_from="2026-01-01",
+                valid_to="2026-02-01",
+            )
+        for i in range(3):
+            kg.add_triple("project:hub", "pending_task", f"live task {i}", valid_from="2026-03-01")
+        monkeypatch.setattr(mcp_server, "KG_RESULT_CAP", 4)
+
+        result = mcp_server.tool_kg_query(entity="project:hub", predicate="pending_task")
+        summary = result["summary"]
+        # The number a caller actually wants is 3 open, not 12 rows.
+        assert summary["total"] == 12
+        assert summary["current"] == 3
+        assert summary["invalidated"] == 9
+        assert summary["histogram"] == {"pending_task": [3, 9]}
+        # A single-predicate query spends the whole budget on depth, and the
+        # live facts are exhausted before any dead one takes a slot.
+        assert result["count"] == 4
+        assert [f["valid_to"] is None for f in result["facts"]] == [True, True, True, False]
+        assert "93 current" not in result["notice"]
+        assert "3 current / 9 invalidated" in result["notice"]
+
+    def test_kg_summary_spreads_the_budget_across_predicates(
+        self, monkeypatch, config, palace_path, kg
+    ):
+        from mempalace import mcp_server
+
+        _patch_mcp_server(monkeypatch, config, kg)
+        for i in range(20):
+            kg.add_triple("project:hub", "learned_pattern", f"pattern {i}", valid_from="2026-01-01")
+        kg.add_triple("project:hub", "is_status", "live", valid_from="2026-01-02")
+        kg.add_triple("project:hub", "pinned_to", "v3", valid_from="2026-01-03")
+        monkeypatch.setattr(mcp_server, "KG_RESULT_CAP", 6)
+
+        result = mcp_server.tool_kg_query(entity="project:hub")
+        shown = {}
+        for fact in result["facts"]:
+            shown[fact["predicate"]] = shown.get(fact["predicate"], 0) + 1
+        # Round-robin: the two singleton predicates are not crowded out by the
+        # 20-fact one, which is exactly what a prefix did to them.
+        assert shown == {"learned_pattern": 4, "is_status": 1, "pinned_to": 1}
+        assert result["summary"]["predicates_sampled"] == 3
+        assert "predicates_unsampled" not in result["summary"]
+
+    def test_kg_summary_histogram_lists_every_predicate(self, monkeypatch, config, palace_path, kg):
+        from mempalace import mcp_server
+
+        _patch_mcp_server(monkeypatch, config, kg)
+        for i in range(40):
+            kg.add_triple("project:hub", f"pred_{i:02d}", f"object {i}", valid_from="2026-01-01")
+        monkeypatch.setattr(mcp_server, "KG_RESULT_CAP", 5)
+
+        result = mcp_server.tool_kg_query(entity="project:hub")
+        summary = result["summary"]
+        # The top-level 'predicates' field is still capped at 25; the summary
+        # histogram is not, because "nothing invisible" is its whole job.
+        assert len(result["predicates"]) == mcp_server.KG_PREDICATE_HISTOGRAM_LIMIT
+        assert len(summary["histogram"]) == 40
+        assert summary["predicates_distinct"] == 40
+        assert summary["predicates_sampled"] == 5
+        assert summary["predicates_unsampled"] == 35
+        assert "histogram_omitted" not in summary
+
+    def test_kg_summary_histogram_cap_announces_itself(self, monkeypatch, config, palace_path, kg):
+        from mempalace import mcp_server
+
+        _patch_mcp_server(monkeypatch, config, kg)
+        for i in range(10):
+            kg.add_triple("project:hub", f"pred_{i:02d}", f"object {i}", valid_from="2026-01-01")
+        monkeypatch.setattr(mcp_server, "KG_SUMMARY_HISTOGRAM_LIMIT", 4)
+
+        summary = mcp_server.tool_kg_query(entity="project:hub", summary=True)["summary"]
+        assert len(summary["histogram"]) == 4
+        assert summary["histogram_omitted"] == 6
+        assert "not listed" in summary["histogram_notice"]
+
+    def test_kg_summary_response_stays_under_the_response_cap(
+        self, monkeypatch, config, palace_path, kg
+    ):
+        import json
+
+        from mempalace import mcp_server
+
+        _patch_mcp_server(monkeypatch, config, kg)
+        for i in range(300):
+            kg.add_triple(
+                "project:hub", f"pred_{i % 30:02d}", "x" * 120 + str(i), valid_from="2026-01-01"
+            )
+        monkeypatch.setattr(mcp_server, "MAX_RESPONSE_CHARS", 20000)
+
+        result = mcp_server.tool_kg_query(entity="project:hub")
+        text = json.dumps(result, indent=2, ensure_ascii=False)
+        # Sized here, not chopped by the generic backstop — so the notice is
+        # still true and the rarest predicates were not silently deleted.
+        assert len(text) <= mcp_server.MAX_RESPONSE_CHARS
+        assert result["count"] == len(result["facts"]) == result["summary"]["facts_shown"]
+        assert f"showing {result['count']} of 300" in result["notice"]
+        _, fitted_text = mcp_server._fit_response(result, tool_name="mempalace_kg_query")
+        assert fitted_text == text
+
+    def test_kg_summary_composes_with_predicate_direction_and_as_of(
+        self, monkeypatch, config, palace_path, seeded_kg
+    ):
+        _patch_mcp_server(monkeypatch, config, seeded_kg)
+        from mempalace.mcp_server import tool_kg_query
+
+        # as_of already filters validity in SQL, so nothing is invalidated here.
+        result = tool_kg_query(
+            entity="Alice", direction="outgoing", as_of="2025-06-01", summary=True
+        )
+        assert result["summary"]["histogram"] == {"parent_of": [1, 0], "works_at": [1, 0]}
+
+        filtered = tool_kg_query(
+            entity="Alice", direction="outgoing", predicate="works_at", summary=True
+        )
+        assert filtered["summary"]["histogram"] == {"works_at": [1, 1]}
+        assert filtered["predicate"] == ["works_at"]
+
+    def test_kg_summary_rejects_a_non_boolean(self, monkeypatch, config, palace_path, seeded_kg):
+        _patch_mcp_server(monkeypatch, config, seeded_kg)
+        from mempalace.mcp_server import tool_kg_query
+
+        assert "error" in tool_kg_query(entity="Max", summary="yes")
+        assert "error" in tool_kg_query(entity="Max", summary=1.5)
+
+    def test_kg_summary_of_a_zero_match_query_stays_a_dead_end_rescue(
+        self, monkeypatch, config, palace_path, seeded_kg
+    ):
+        _patch_mcp_server(monkeypatch, config, seeded_kg)
+        from mempalace.mcp_server import tool_kg_query
+
+        result = tool_kg_query(entity="Max", predicate="learned", summary=True)
+        assert result["count"] == 0
+        assert "summary" not in result
+        assert "synonym" in result["predicate_hint"]
+
+    def test_kg_query_schema_documents_the_summary_parameter(self):
+        from mempalace.mcp_server import TOOLS
+
+        entry = TOOLS["mempalace_kg_query"]
+        assert entry["input_schema"]["properties"]["summary"]["type"] == "boolean"
+        assert entry["input_schema"]["required"] == ["entity"]
+        assert "summary" in entry["description"]
+
     # ── v3.10 port: predicate filter vs upstream candidate resolution ──
 
     def test_predicate_filter_applies_to_candidate_fallback(
@@ -744,11 +973,50 @@ class TestKGTools:
         from mempalace import mcp_server
 
         monkeypatch.setattr(mcp_server, "KG_RESULT_CAP", 1)
-        result = mcp_server.tool_kg_query(entity="Alice")
+        result = mcp_server.tool_kg_query(entity="Alice", summary=False)
         shipped = result["facts"]
         bucketed = result["active_facts"] + result["historical_facts"] + result["future_facts"]
         assert len(shipped) == 1
         assert bucketed == shipped
+
+    def test_size_cut_keeps_facts_and_buckets_consistent(
+        self, monkeypatch, config, palace_path, kg
+    ):
+        """Under the fact cap but over the char cap: the prefix is sized in-tool,
+        so 'facts' and its bucket copies are cut together and the JSON fits."""
+        import json
+
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace import mcp_server
+
+        for i in range(20):
+            kg.add_triple("Big", "note", f"{i:02d} " + "x" * 100, valid_from=f"2026-01-{i + 1:02d}")
+        monkeypatch.setattr(mcp_server, "MAX_RESPONSE_CHARS", 4000)
+        result = mcp_server.tool_kg_query(entity="Big", summary=False)
+        assert len(json.dumps(result, indent=2, ensure_ascii=False)) <= 4000
+        assert 0 < result["count"] < 20
+        assert result["total"] == 20 and result["truncated"] is True
+        assert result["active_facts"] == result["facts"]
+        assert "char" in result["notice"] and "fact cap" not in result["notice"]
+
+    def test_summary_sample_fits_with_bucket_duplication(
+        self, monkeypatch, config, palace_path, kg
+    ):
+        import json
+
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace import mcp_server
+
+        for i in range(30):
+            kg.add_triple("Hub", f"p{i % 6}", f"{i:02d} " + "y" * 80, valid_from="2026-02-01")
+        monkeypatch.setattr(mcp_server, "KG_RESULT_CAP", 10)
+        monkeypatch.setattr(mcp_server, "MAX_RESPONSE_CHARS", 6000)
+        result = mcp_server.tool_kg_query(entity="Hub")
+        assert "summary" in result
+        assert len(json.dumps(result, indent=2, ensure_ascii=False)) <= 6000
+        assert len(result["summary"]["histogram"]) == 6
+        bucketed = result["active_facts"] + result["historical_facts"] + result["future_facts"]
+        assert sorted(map(str, bucketed)) == sorted(map(str, result["facts"]))
 
 
 class TestKGLazyCache:

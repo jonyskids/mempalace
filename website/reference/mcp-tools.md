@@ -259,6 +259,7 @@ Query entity relationships with time filtering.
 | `as_of` | string | No | Date filter — only facts valid at this date (YYYY-MM-DD) |
 | `direction` | string | No | `outgoing`, `incoming`, or `both` (default: `both`) |
 | `predicate` | string or array | No | Return only these relationship types. One name (`"completed"`), a comma-separated list (`"completed,shipped"`), or an array. Case and spaces are normalized. Omit for every fact. |
+| `summary` | boolean | No | Summary mode. Omit for automatic (only when the result overflows), `true` to summarize any entity, `false` to force the plain truncated prefix. |
 
 `predicate`, `direction` and `as_of` are applied together in one query.
 
@@ -276,6 +277,49 @@ entity's predicates in the same direction/as-of slice), `predicates_distinct`, a
 optional `predicates_omitted`, and a `predicate_hint` telling the caller what to
 re-query: an **unfiltered query that overflowed**, and a **filtered query that matched
 nothing** (usually a predicate synonym).
+
+#### Summary mode
+
+A result too large to return whole is summarized instead of being cut to an arbitrary
+prefix. The response gains a `summary` block:
+
+```
+summary: {
+  total, current, invalidated,        # split, not blended
+  predicates_distinct,
+  histogram_format,                   # "predicate: [current_facts, invalidated_facts]"
+  histogram,                          # EVERY predicate on the entity, with its counts
+  facts_shown, predicates_sampled,
+  predicates_unsampled?, histogram_omitted?, histogram_notice?,
+  selection_rule
+}
+```
+
+Two things this fixes. Without `as_of`, a query applies no validity filter, so a raw
+count blends invalidated facts with live ones and over-reports what is actually open;
+every count in `summary` is split. And the histogram names every predicate on the
+entity, so a predicate can go unsampled but never invisible — the caller always has the
+exact name to re-query with `predicate=`.
+
+`facts` then holds a derived sample rather than a prefix: facts are allocated
+round-robin across predicates (widest live slice first), current facts before
+invalidated ones, most recent first within each group. There is no fixed per-predicate
+N — round-robin derives it from the entity. A single-predicate query spends the whole
+budget on depth; a 189-predicate query spends it on breadth. The sample is sized so the
+whole response fits the character cap, so the count in the `notice` is exact.
+
+Everything here is derived at read time from the facts already in hand. There is no
+summary table and no cache, so a summary can never be stale and always describes exactly
+the `predicate` / `direction` / `as_of` slice that was queried.
+
+`summary` is automatic on overflow because the failure it fixes is one the caller cannot
+detect: an over-cap response looked authoritative. Pass `summary: true` to summarize an
+entity whose facts do fit — useful for asking what an entity carries without pulling
+every fact — or `summary: false` to opt out. A response that fits is untouched by
+default: same keys, same facts, same order.
+
+`MEMPALACE_KG_SUMMARY_HISTOGRAM_LIMIT` (default 500) bounds the histogram; going over it
+sets `histogram_omitted` and `histogram_notice`.
 
 ---
 

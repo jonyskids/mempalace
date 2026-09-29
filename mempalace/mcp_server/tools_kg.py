@@ -68,6 +68,21 @@ def _fact_interval_bucket(row: dict, now_key: str) -> str:
 KG_PREDICATE_HISTOGRAM_LIMIT = 25
 
 
+# Max predicates listed in a SUMMARY histogram. This one is deliberately far
+# larger than KG_PREDICATE_HISTOGRAM_LIMIT: the summary histogram's entire job
+# is that nothing on the entity is invisible, so it lists every predicate and
+# only degrades on an entity pathological enough to threaten the response cap
+# on histogram rows alone (project:digital-p carried 187 on 2026-08-24). When
+# it does degrade it says so, in the same explicit style as every other
+# truncation here. Override via MEMPALACE_KG_SUMMARY_HISTOGRAM_LIMIT.
+try:
+    KG_SUMMARY_HISTOGRAM_LIMIT = max(
+        1, int(os.environ.get("MEMPALACE_KG_SUMMARY_HISTOGRAM_LIMIT", "500"))
+    )
+except (ValueError, TypeError):
+    KG_SUMMARY_HISTOGRAM_LIMIT = 500
+
+
 def _normalize_predicate_filter(predicate):
     """Normalize the ``predicate=`` argument of ``tool_kg_query``.
 
@@ -132,6 +147,120 @@ def _predicate_histogram(results, limit: Optional[int] = None):
     return top, len(ordered) - len(top), len(ordered)
 
 
+def _summarize_facts(results, *, budget: int, histogram_limit: Optional[int] = None):
+    """Derive a read-time summary of ``results``. Returns ``(sample, summary)``.
+
+    Everything here is computed from the facts already in hand, so it describes
+    exactly the ``direction`` / ``as_of`` / ``predicate`` slice the caller asked
+    about and can never be stale. There is no summary table and no cache — that
+    is the point.
+
+    Two failures of a plain result cap are addressed:
+
+    * **Blended validity.** ``query_entity`` applies no ``valid_to`` filter
+      unless ``as_of`` is given, so a raw count of a hub predicate counts dead
+      facts alongside live ones and over-reports what is actually open
+      (``project:digital-p`` / ``pending_task``: 335 rows, 93 of them current on
+      2026-08-24). Every count here is split ``[current, invalidated]``.
+    * **A silent cut mid-set.** The histogram names EVERY predicate on the
+      entity with its counts, so a predicate can be unsampled but never
+      invisible, and the caller always has the exact name to re-query with.
+
+    The sample is allocated round-robin: predicates in histogram order (widest
+    live slice first) each yield their most recent current fact, then their
+    second, and so on until ``budget`` is spent. Current facts are exhausted
+    before invalidated ones within a predicate, so a predicate with live facts
+    never spends its slot on a dead one. There is deliberately no fixed
+    per-predicate N: round-robin derives it from the shape of the entity.
+    A single-predicate query spends the whole budget on depth (the 335-row
+    ``pending_task`` slice comes back as its 93 current facts plus the most
+    recent dead ones); a 187-predicate query spends it on breadth.
+    """
+    if histogram_limit is None:
+        histogram_limit = KG_SUMMARY_HISTOGRAM_LIMIT
+
+    buckets: dict = {}
+    for fact in results:
+        if not isinstance(fact, dict):
+            continue
+        pred = fact.get("predicate")
+        if pred is None:
+            continue
+        bucket = buckets.setdefault(pred, {"current": [], "invalidated": []})
+        bucket["current" if fact.get("valid_to") is None else "invalidated"].append(fact)
+
+    # Live slices first: a caller asking a hub entity "what is open" is served
+    # worse by a predicate with 200 dead facts than by one with 3 live ones.
+    ordered = sorted(
+        buckets.items(),
+        key=lambda kv: (
+            -len(kv[1]["current"]),
+            -(len(kv[1]["current"]) + len(kv[1]["invalidated"])),
+            kv[0],
+        ),
+    )
+
+    queues = {pred: bucket["current"] + bucket["invalidated"] for pred, bucket in ordered}
+    picked: dict = {pred: [] for pred, _ in ordered}
+    taken = 0
+    depth = 0
+    while taken < budget:
+        progressed = False
+        for pred, _ in ordered:
+            if taken >= budget:
+                break
+            queue = queues[pred]
+            if depth < len(queue):
+                picked[pred].append(queue[depth])
+                taken += 1
+                progressed = True
+        if not progressed:
+            break
+        depth += 1
+
+    # Emit grouped by predicate rather than in round-robin pick order, so a
+    # reader sees each slice together instead of interleaved.
+    sample = []
+    for pred, _ in ordered:
+        sample.extend(picked[pred])
+
+    histogram = {
+        pred: [len(bucket["current"]), len(bucket["invalidated"])]
+        for pred, bucket in ordered[:histogram_limit]
+    }
+    sampled = sum(1 for pred in picked if picked[pred])
+
+    summary = {
+        "total": len(results),
+        "current": sum(len(b["current"]) for b in buckets.values()),
+        "invalidated": sum(len(b["invalidated"]) for b in buckets.values()),
+        "predicates_distinct": len(ordered),
+        "histogram_format": "predicate: [current_facts, invalidated_facts]",
+        "histogram": histogram,
+        "facts_shown": len(sample),
+        "predicates_sampled": sampled,
+        "selection_rule": (
+            f"'facts' is a derived sample, not a prefix: up to {budget} facts allocated "
+            "round-robin across predicates (widest live slice first), current facts before "
+            "invalidated ones, most recent first within each group. 'histogram' counts ALL "
+            "facts on this entity by predicate, so nothing is hidden. Re-query with "
+            "predicate='<name>' to get one slice whole."
+        ),
+    }
+
+    unsampled = len(ordered) - sampled
+    if unsampled:
+        summary["predicates_unsampled"] = unsampled
+    if len(ordered) > histogram_limit:
+        summary["histogram_omitted"] = len(ordered) - histogram_limit
+        summary["histogram_notice"] = (
+            f"{len(ordered) - histogram_limit} rarer predicate(s) not listed in 'histogram' "
+            f"(showing the {histogram_limit} with the most current facts, of "
+            f"{len(ordered)}); raise MEMPALACE_KG_SUMMARY_HISTOGRAM_LIMIT to see them all"
+        )
+    return sample, summary
+
+
 def _interval_buckets(facts: list, as_of) -> tuple[list, list, list]:
     """Split shipped facts into v3.10's active / historical / future buckets."""
     if as_of is not None:
@@ -183,11 +312,39 @@ def _kg_query_resolve_entity(payload: dict, entity: str, results: list, *, looku
             payload["candidates"] = candidates
 
 
+def _fits_response_cap(response) -> bool:
+    return len(json.dumps(response, indent=2, ensure_ascii=False)) <= MAX_RESPONSE_CHARS
+
+
+def _largest_fitting(build, hi: int):
+    """Return ``build(n)`` for the largest ``n <= hi`` whose response fits.
+
+    Serialized size grows monotonically with the fact budget, so bisection
+    finds it. When even ``build(1)`` is over the cap, ``build(1)`` is returned
+    and the dispatch backstop (``_fit_response``) has the last word.
+    """
+    response = build(hi)
+    if hi <= 1 or _fits_response_cap(response):
+        return response
+    best = None
+    lo, hi = 1, hi - 1
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        trial = build(mid)
+        if _fits_response_cap(trial):
+            best = trial
+            lo = mid + 1
+        else:
+            hi = mid - 1
+    return best if best is not None else build(1)
+
+
 def tool_kg_query(
     entity: str,
     as_of: str = None,
     direction: str = "both",
     predicate=None,
+    summary=None,
 ):
     """Query the knowledge graph for an entity's relationships.
 
@@ -202,9 +359,35 @@ def tool_kg_query(
     histogram and an instruction, so a dead end becomes a next query instead
     of a silent absence the caller misreads as "no such fact".
 
-    The fact cap is applied BEFORE v3.10's active / historical / future
-    buckets are derived, so the buckets always describe exactly the facts in
-    ``facts`` and never a superset of them.
+    ``summary`` controls summary mode, which replaces an arbitrary truncated
+    prefix with a complete per-predicate histogram (split current vs
+    invalidated) plus a representative sample of the facts themselves. See
+    ``_summarize_facts``. Three states:
+
+    * ``None`` (default) — automatic, and only when the result overflows
+      ``KG_RESULT_CAP``. A response that fits is untouched: same keys, same
+      facts, same order as before this parameter existed.
+    * ``True`` — always summarize, even under the cap. This is how a caller
+      asks "what does this entity carry?" without pulling every fact.
+    * ``False`` — never summarize. Escape hatch back to the plain recent-first
+      prefix for a caller that wants exactly the old truncation behaviour.
+
+    Automatic-on-overflow rather than opt-in-only because the failure it
+    fixes is one the caller cannot detect: an over-cap response looked
+    authoritative, and a count that blended dead facts with live ones
+    over-reported what was open. A caller who has to know to ask is a caller
+    who is still misled by default. Opt-in as well because a summary of an
+    entity that fits is genuinely useful and nothing else offers it.
+
+    v3.10 ships every fact twice — in ``facts`` and again in one of the
+    ``active_facts`` / ``historical_facts`` / ``future_facts`` buckets — and
+    the buckets are always derived from the facts that ship. Both the plain
+    prefix and the summary sample are therefore sized to
+    ``MAX_RESPONSE_CHARS`` here, by bisecting the fact budget, rather than
+    left to ``_fit_response``: the generic backstop drops items off the tail
+    of the single largest list, which would cut ``facts`` while leaving its
+    bucket copies whole (and, for a grouped summary sample, silently delete
+    the rarest predicates' only fact and relabel it "showing first N").
     """
     try:
         entity = sanitize_kg_value(entity, "entity")
@@ -215,6 +398,9 @@ def tool_kg_query(
     if direction not in ("outgoing", "incoming", "both"):
         return {"error": "direction must be 'outgoing', 'incoming', or 'both'"}
 
+    if summary is not None and not isinstance(summary, bool):
+        return {"error": "summary must be true or false"}
+
     predicates, predicate_error = _normalize_predicate_filter(predicate)
     if predicate_error is not None:
         return {"error": predicate_error}
@@ -222,7 +408,9 @@ def tool_kg_query(
     results = _call_kg(
         lambda kg: kg.query_entity(entity, as_of=as_of, direction=direction, predicates=predicates)
     )
-    total = len(results) if isinstance(results, list) else None
+    if not isinstance(results, list):
+        results = []
+    total = len(results)
 
     if predicates:
         narrow_hint = (
@@ -235,30 +423,47 @@ def tool_kg_query(
             "narrow with predicate= (the 'predicates' field in this response lists the "
             "available slices and their fact counts), as_of= or direction="
         )
-    facts, notice = _cap_facts(results, narrow_hint=narrow_hint)
+    over_cap = total > KG_RESULT_CAP
+    summarizing = bool(results) and (summary is True or (summary is None and over_cap))
 
-    response = _kg_query_base_payload(entity, as_of, facts)
-    if predicates:
-        response["predicate"] = predicates
-    if notice is not None:
-        response["total"] = total
-        response["truncated"] = True
-        response["notice"] = notice
-
-    # Rescue the two dead ends: an unfiltered query too big to return whole,
-    # and a filtered query that matched nothing (usually a predicate synonym).
-    histogram_source = None
-    hint = None
-    if not predicates and notice is not None and isinstance(results, list):
-        histogram_source = results
-        hint = (
-            f"Showing an arbitrary first {KG_RESULT_CAP} of {total} facts. Re-query with "
-            "predicate='<name>' (or a comma-separated list) to get one COMPLETE slice "
-            "instead. 'predicates' lists this entity's predicates by fact count."
-        )
-    elif predicates and isinstance(results, list) and not results:
+    # A filtered miss is answered from the unfiltered slice; fetch it once,
+    # not once per bisection step.
+    unfiltered = None
+    if predicates and not results:
         unfiltered = _call_kg(lambda kg: kg.query_entity(entity, as_of=as_of, direction=direction))
-        if isinstance(unfiltered, list) and unfiltered:
+
+    def assemble(facts, notice, summary_block):
+        response = _kg_query_base_payload(entity, as_of, facts)
+        if predicates:
+            response["predicate"] = predicates
+        if notice is not None:
+            response["total"] = total
+            response["truncated"] = True
+            response["notice"] = notice
+        if summary_block is not None:
+            response["summary"] = summary_block
+
+        # Rescue the two dead ends: an unfiltered query too big to return whole,
+        # and a filtered query that matched nothing (usually a predicate synonym).
+        histogram_source = None
+        hint = None
+        if not predicates and notice is not None:
+            histogram_source = results
+            if summary_block is not None:
+                hint = (
+                    f"Showing a representative {len(facts)} of {total} facts, sampled across "
+                    "predicates. Re-query with predicate='<name>' (or a comma-separated list) "
+                    "to get one COMPLETE slice instead. 'summary.histogram' counts every "
+                    "predicate on this entity split current/invalidated; 'predicates' is the "
+                    "top slice of it by raw fact count."
+                )
+            else:
+                hint = (
+                    f"Showing an arbitrary first {len(facts)} of {total} facts. Re-query "
+                    "with predicate='<name>' (or a comma-separated list) to get one COMPLETE "
+                    "slice instead. 'predicates' lists this entity's predicates by fact count."
+                )
+        elif isinstance(unfiltered, list) and unfiltered:
             histogram_source = unfiltered
             hint = (
                 f"No fact on this entity uses predicate {', '.join(predicates)} in this "
@@ -266,24 +471,57 @@ def tool_kg_query(
                 "check for a synonym there before writing a new fact."
             )
 
-    # Entity candidates only when the entity itself carries nothing: a
-    # filtered miss on an entity that DOES have facts is answered by the
-    # predicate histogram, not by a list of similarly named entities.
-    _kg_query_resolve_entity(response, entity, results, lookup_candidates=not histogram_source)
+        # Entity candidates only when the entity itself carries nothing: a
+        # filtered miss on an entity that DOES have facts is answered by the
+        # predicate histogram, not by a list of similarly named entities.
+        _kg_query_resolve_entity(response, entity, results, lookup_candidates=not histogram_source)
 
-    if histogram_source:
-        top, omitted, distinct = _predicate_histogram(histogram_source)
-        response["predicates"] = top
-        response["predicates_distinct"] = distinct
-        if omitted:
-            response["predicates_omitted"] = omitted
-            hint = (
-                hint + f" ({omitted} rarer predicate(s) not listed; "
-                f"showing the top {len(top)} of {distinct}.)"
+        if histogram_source:
+            top, omitted, distinct = _predicate_histogram(histogram_source)
+            response["predicates"] = top
+            response["predicates_distinct"] = distinct
+            if omitted:
+                response["predicates_omitted"] = omitted
+                hint = (
+                    hint + f" ({omitted} rarer predicate(s) not listed; "
+                    f"showing the top {len(top)} of {distinct}.)"
+                )
+            response["predicate_hint"] = hint
+
+        return response
+
+    # Cut for SIZE rather than for the fact cap: the facts fit the cap but not
+    # the response, so "you are over the fact cap" would be false.
+    size_hint = (
+        f"the facts are too large to return whole under the {MAX_RESPONSE_CHARS}-char "
+        "response cap — narrow with predicate=, as_of= or direction="
+    )
+
+    def plain(limit):
+        if limit >= KG_RESULT_CAP:
+            facts, notice = _cap_facts(results, narrow_hint=narrow_hint)
+            return assemble(facts, notice, None)
+        notice = (
+            f"{total - limit} more fact(s) omitted (showing first {limit} of "
+            f"{total}); {narrow_hint if over_cap else size_hint}"
+        )
+        return assemble(results[:limit], notice, None)
+
+    def summarized(budget):
+        facts, summary_block = _summarize_facts(results, budget=budget)
+        notice = None
+        if len(facts) < total:
+            notice = (
+                f"{total - len(facts)} more fact(s) not shown (showing {len(facts)} of "
+                f"{total}: {summary_block['current']} current / "
+                f"{summary_block['invalidated']} invalidated across "
+                f"{summary_block['predicates_distinct']} predicate(s)). 'facts' is a "
+                "representative sample and 'summary.histogram' counts every predicate on "
+                f"this entity, so nothing is hidden — {narrow_hint if over_cap else size_hint}"
             )
-        response["predicate_hint"] = hint
+        return assemble(facts, notice, summary_block)
 
-    return response
+    return _largest_fitting(summarized if summarizing else plain, KG_RESULT_CAP)
 
 
 def tool_kg_add(

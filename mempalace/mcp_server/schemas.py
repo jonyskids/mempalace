@@ -46,7 +46,11 @@ TOOLS = {
             "an arbitrary truncated prefix of everything. predicate, direction and as_of compose. "
             "Any truncation is always reported in a 'notice' field, never silent; an unfiltered "
             "query that overflows, and a filtered query that matches nothing, both come back "
-            "with a 'predicates' histogram naming the slices available to re-query."
+            "with a 'predicates' histogram naming the slices available to re-query. "
+            "A result too big to return whole is summarized automatically: 'summary' carries a "
+            "COMPLETE per-predicate histogram split into current vs invalidated facts, and "
+            "'facts' becomes a sample spread across predicates instead of an arbitrary prefix. "
+            "Pass summary=true to get that for any entity, or summary=false to opt out."
         ),
         "input_schema": {
             "type": "object",
@@ -74,6 +78,15 @@ TOOLS = {
                         {"type": "string"},
                         {"type": "array", "items": {"type": "string"}},
                     ],
+                },
+                "summary": {
+                    "type": "boolean",
+                    "description": (
+                        "Summary mode (optional). Omit for automatic: a result that fits comes "
+                        "back exactly as before, one that overflows is summarized. true "
+                        "summarizes any entity — use it to ask what an entity carries without "
+                        "pulling every fact. false forces the plain truncated prefix instead."
+                    ),
                 },
             },
             "required": ["entity"],
