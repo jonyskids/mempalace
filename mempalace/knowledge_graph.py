@@ -493,6 +493,17 @@ class KnowledgeGraph:
 
     # ── Query operations ──────────────────────────────────────────────────
 
+    # query_entity had NO sort at all, so SQLite returned rowid order — insertion
+    # order — and KG_RESULT_CAP then kept the FIRST 100. On a hub entity that means
+    # the 100 facts a caller gets back are the OLDEST, which are also the most likely
+    # to be already invalidated: project:digital-p returned April facts while the
+    # week's work was unreachable. Recent-first makes the cap keep what a caller
+    # actually asked about. NULLS LAST so an undated fact never displaces a dated one.
+    #
+    # NOT applied to timeline() — a timeline is chronological by definition and its
+    # ASC is correct there.
+    _RECENT_FIRST = " ORDER BY t.valid_from DESC NULLS LAST"
+
     def query_entity(
         self,
         name: str,
@@ -548,7 +559,9 @@ class KnowledgeGraph:
             if direction in ("outgoing", "both"):
                 query = (
                     "SELECT t.*, e.name as obj_name FROM triples t "
-                    "JOIN entities e ON t.object = e.id WHERE t.subject = ?" + filter_sql
+                    "JOIN entities e ON t.object = e.id WHERE t.subject = ?"
+                    + filter_sql
+                    + self._RECENT_FIRST
                 )
                 params = [eid] + filter_params
 
@@ -570,7 +583,9 @@ class KnowledgeGraph:
             if direction in ("incoming", "both"):
                 query = (
                     "SELECT t.*, e.name as sub_name FROM triples t "
-                    "JOIN entities e ON t.subject = e.id WHERE t.object = ?" + filter_sql
+                    "JOIN entities e ON t.subject = e.id WHERE t.object = ?"
+                    + filter_sql
+                    + self._RECENT_FIRST
                 )
                 params = [eid] + filter_params
 
@@ -656,7 +671,9 @@ class KnowledgeGraph:
         if direction in ("outgoing", "both"):
             query = (
                 "SELECT t.*, e.name as obj_name FROM triples t "
-                "JOIN entities e ON t.object = e.id WHERE t.subject = ?" + temporal_sql
+                "JOIN entities e ON t.object = e.id WHERE t.subject = ?"
+                + temporal_sql
+                + self._RECENT_FIRST
             )
             for row in conn.execute(query, [eid] + temporal_params).fetchall():
                 results.append(
@@ -675,7 +692,9 @@ class KnowledgeGraph:
         if direction in ("incoming", "both"):
             query = (
                 "SELECT t.*, e.name as sub_name FROM triples t "
-                "JOIN entities e ON t.subject = e.id WHERE t.object = ?" + temporal_sql
+                "JOIN entities e ON t.subject = e.id WHERE t.object = ?"
+                + temporal_sql
+                + self._RECENT_FIRST
             )
             for row in conn.execute(query, [eid] + temporal_params).fetchall():
                 results.append(

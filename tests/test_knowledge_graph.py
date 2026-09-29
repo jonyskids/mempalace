@@ -160,6 +160,15 @@ class TestQueryEntityPredicateFilter:
         assert seeded_kg.query_entity("Alice", direction="both", predicates=["nope"]) == []
 
 
+class TestQueryOrder:
+    def test_query_entity_is_recent_first_with_undated_last(self, kg):
+        kg.add_triple("Hub", "did", "old", valid_from="2024-01-01")
+        kg.add_triple("Hub", "did", "undated")
+        kg.add_triple("Hub", "did", "new", valid_from="2026-01-01")
+        objs = [f["object"] for f in kg.query_entity("Hub", direction="outgoing")]
+        assert objs == ["new", "old", "undated"]
+
+
 class TestInvalidation:
     def test_invalidate_sets_valid_to(self, seeded_kg):
         seeded_kg.invalidate("Max", "does", "chess", ended="2026-01-01")
