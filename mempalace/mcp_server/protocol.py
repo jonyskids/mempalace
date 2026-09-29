@@ -687,6 +687,23 @@ def _normalize_envelope(request: dict) -> "tuple[str, dict]":
     return method, params
 
 
+def _cap_response_text(text: str) -> str:
+    """Backstop against any tool returning an oversized payload.
+
+    A payload that large would overflow the caller's context (one real
+    incident: a broad kg_query returned ~675K chars). Per-tool caps (e.g.
+    _cap_facts) handle the common cases gracefully; this is the last line of
+    defense for everything else. Truncation is announced, not silent.
+    """
+    if len(text) <= MAX_RESPONSE_CHARS:
+        return text
+    return (
+        text[:MAX_RESPONSE_CHARS]
+        + f"\n\n... [response truncated: {len(text)} chars exceeded the "
+        + f"{MAX_RESPONSE_CHARS}-char cap; narrow your query]"
+    )
+
+
 def handle_request(request):
     global _last_request_time
     if not isinstance(request, dict):
@@ -834,15 +851,11 @@ def handle_request(request):
                 result = _decorate_mcp_tool_result(
                     tool_name, TOOLS[tool_name]["handler"](**tool_args)
                 )
-
+            text = _cap_response_text(json.dumps(result, indent=2, ensure_ascii=False))
             return {
                 "jsonrpc": "2.0",
                 "id": req_id,
-                "result": {
-                    "content": [
-                        {"type": "text", "text": json.dumps(result, indent=2, ensure_ascii=False)}
-                    ]
-                },
+                "result": {"content": [{"type": "text", "text": text}]},
             }
         except TypeError as e:
             # Qualname match prevents leaking internal helper/param names raised
